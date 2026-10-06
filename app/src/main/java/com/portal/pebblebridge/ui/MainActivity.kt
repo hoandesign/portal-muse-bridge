@@ -80,12 +80,20 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
+  companion object {
+    /** Set when the Portal screensaver (HomeDreamService) opened us. */
+    const val EXTRA_DREAM_MODE = "dream_mode"
+  }
+
   private val deliveryClient = MuseDeliveryClient()
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     BridgeRepository.initPersistence(this)
+    com.portal.pebblebridge.home.HomePrefs.init(this)
     BridgeService.start(this)
+    applyDreamMode(intent)
+    hideSystemBars()
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
       if (checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -100,13 +108,20 @@ class MainActivity : ComponentActivity() {
     }
 
     setContent {
+      var showSettings by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
+      if (!showSettings) {
+        com.portal.pebblebridge.ui.home.HomeScreen(onOpenSettings = { showSettings = true })
+        return@setContent
+      }
+      androidx.activity.compose.BackHandler { showSettings = false }
       MaterialTheme(colorScheme = darkColorScheme(background = Color(0xFF121214), surface = Color(0xFF1E1E24))) {
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
           BridgeScreen(
+            onBack = { showSettings = false },
             onCopyUrl = { url ->
               val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-              clipboard.setPrimaryClip(ClipData.newPlainText("MCP URL", url))
-              Toast.makeText(this, "Copied MCP URL to clipboard", Toast.LENGTH_SHORT).show()
+              clipboard.setPrimaryClip(ClipData.newPlainText("Webhook URL", url))
+              Toast.makeText(this, "Copied webhook URL", Toast.LENGTH_SHORT).show()
             },
             onSendTestNote = {
               val noteId = UUID.randomUUID().toString()
@@ -134,14 +149,44 @@ class MainActivity : ComponentActivity() {
       }
     }
   }
+
+  override fun onNewIntent(intent: android.content.Intent) {
+    super.onNewIntent(intent)
+    setIntent(intent)
+    applyDreamMode(intent)
+  }
+
+  override fun onWindowFocusChanged(hasFocus: Boolean) {
+    super.onWindowFocusChanged(hasFocus)
+    if (hasFocus) hideSystemBars()
+  }
+
+  /** As the screensaver, keep the screen on (if the user wants) instead of letting it sleep. */
+  private fun applyDreamMode(intent: android.content.Intent?) {
+    val dream = intent?.getBooleanExtra(EXTRA_DREAM_MODE, false) == true
+    if (dream && com.portal.pebblebridge.home.HomePrefs.settings.value.keepAwake) {
+      window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    } else {
+      window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+  }
+
+  private fun hideSystemBars() {
+    androidx.core.view.WindowCompat.getInsetsController(window, window.decorView).apply {
+      hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+      systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    }
+  }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BridgeScreen(
+  onBack: () -> Unit,
   onCopyUrl: (String) -> Unit,
   onSendTestNote: () -> Unit,
 ) {
+  var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
   val serverStatus by BridgeRepository.serverStatus.collectAsState()
   val notes by BridgeRepository.notes.collectAsState()
   val config by BridgeRepository.config.collectAsState()
@@ -152,14 +197,21 @@ fun BridgeScreen(
   var showSettings by remember { mutableStateOf(false) }
 
   val mcpUrl = "http://${serverStatus.localIp}:${serverStatus.port}/api/mcp"
+  val webhookUrl = "http://${serverStatus.localIp}:${serverStatus.port}/ingest"
+  val tailscaleIp = remember { tailscaleAddress() }
 
   Scaffold(
     topBar = {
       TopAppBar(
+        navigationIcon = {
+          androidx.compose.material3.TextButton(onClick = onBack, modifier = Modifier.padding(start = 8.dp)) {
+            Text("◀ Home", fontSize = 16.sp)
+          }
+        },
         title = {
           Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-              "💍 Pebble ➔ 📺 Portal ➔ 🤖 Muse Bridge",
+              "Settings",
               fontWeight = FontWeight.Bold,
               fontSize = 20.sp,
             )
@@ -180,17 +232,25 @@ fun BridgeScreen(
         },
         actions = {
           OutlinedButton(onClick = { showSettings = true }, modifier = Modifier.padding(end = 12.dp)) {
-            Text("⚙ Settings")
+            Text("⚙ Connection")
           }
         },
         colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF18181B)),
       )
     }
   ) { padding ->
-    Row(
+    Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+    androidx.compose.material3.TabRow(selectedTabIndex = tab, containerColor = Color(0xFF18181B)) {
+      listOf("Status", "Home screen", "Screensaver").forEachIndexed { i, label ->
+        androidx.compose.material3.Tab(selected = tab == i, onClick = { tab = i }, text = { Text(label, fontSize = 15.sp) })
+      }
+    }
+    when (tab) {
+      1 -> com.portal.pebblebridge.ui.settings.HomeSettingsPanel()
+      2 -> com.portal.pebblebridge.ui.settings.ScreensaverSettingsPanel()
+      else -> Row(
       modifier = Modifier
         .fillMaxSize()
-        .padding(padding)
         .padding(16.dp),
       horizontalArrangement = Arrangement.spacedBy(16.dp)
     ) {
@@ -209,21 +269,18 @@ fun BridgeScreen(
         ) {
           Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Pebble App Connection", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color(0xFFE4E4E7))
-            Text("In Pebble App ➔ MCP & Tool Settings:", fontSize = 13.sp, color = Color(0xFFA1A1AA))
-
-            Text("Transport: Streamable HTTP", fontSize = 12.sp, color = Color(0xFFD4D4D8))
-            Text("URL:", fontSize = 12.sp, color = Color(0xFFD4D4D8))
-            Text(
-              mcpUrl,
-              fontFamily = FontFamily.Monospace,
-              fontWeight = FontWeight.SemiBold,
-              fontSize = 14.sp,
-              color = Color(0xFF60A5FA),
-            )
+            Text("Pebble app ➔ Index 01 Settings ➔ Webhook (Transcription only):", fontSize = 13.sp, color = Color(0xFFA1A1AA))
+            Text("At home:", fontSize = 12.sp, color = Color(0xFFD4D4D8))
+            Text(webhookUrl, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Color(0xFF60A5FA))
+            if (tailscaleIp != null) {
+              Text("Anywhere (Tailscale):", fontSize = 12.sp, color = Color(0xFFD4D4D8))
+              Text("http://$tailscaleIp:${serverStatus.port}/ingest", fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Color(0xFF60A5FA))
+            }
+            Text("MCP (for agents): $mcpUrl", fontSize = 11.sp, color = Color(0xFF71717A))
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
               Button(
-                onClick = { onCopyUrl(mcpUrl) },
+                onClick = { onCopyUrl(webhookUrl) },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
               ) {
                 Text("Copy URL")
@@ -333,8 +390,8 @@ fun BridgeScreen(
           ) {
             BridgeAvatar(modifier = Modifier.size(72.dp))
             Column {
-              Text("Jollybot", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color(0xFFE4E4E7))
-              Text("Meta Muse Official Avatar", fontSize = 12.sp, color = Color(0xFFA1A1AA))
+              Text("Pixel Bot", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color(0xFFE4E4E7))
+              Text("Lives on the home screen", fontSize = 12.sp, color = Color(0xFFA1A1AA))
               Text(
                 if (serverStatus.isRunning) "● Ready for Pebble Notes" else "● Stopped",
                 fontSize = 11.sp,
@@ -375,7 +432,7 @@ fun BridgeScreen(
               Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 BridgeAvatar(modifier = Modifier.size(160.dp))
                 Spacer(modifier = Modifier.height(16.dp))
-                Text("Jollybot is Listening", fontSize = 18.sp, color = Color(0xFFF4F4F5), fontWeight = FontWeight.Bold)
+                Text("Waiting for your ring", fontSize = 18.sp, color = Color(0xFFF4F4F5), fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
                   "Speak into your Pebble Index ring or tap 'Send Test Note'",
@@ -396,6 +453,8 @@ fun BridgeScreen(
           }
         }
       }
+    }
+    }
     }
   }
 
@@ -662,3 +721,15 @@ fun PairingConfirmationDialog(
   }
 }
 
+
+/** The Portal's Tailscale address (100.64.0.0/10), if Tailscale is connected. */
+private fun tailscaleAddress(): String? = try {
+  java.net.NetworkInterface.getNetworkInterfaces().toList()
+    .flatMap { it.inetAddresses.toList() }
+    .filterIsInstance<java.net.Inet4Address>()
+    .map { it.hostAddress ?: "" }
+    .firstOrNull { ip ->
+      val parts = ip.split(".").mapNotNull { it.toIntOrNull() }
+      parts.size == 4 && parts[0] == 100 && parts[1] in 64..127
+    }
+} catch (_: Exception) { null }

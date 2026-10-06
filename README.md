@@ -76,6 +76,37 @@ Test by turning Wi-Fi off on your phone and recording a note over mobile data.
 - *Testing from a laptop fails but the phone works:* other VPN apps on the laptop (Mullvad, Cloudflare WARP, …) often block Tailscale traffic. Test from the phone.
 - *After a power cut:* check that Tailscale on the Portal reconnected, then give Muse a few minutes to accept the Portal again.
 
+## Pixel home screen
+
+The app opens on a Game Boy–style home screen:
+
+- **Left:** an 8-bit robot on a lit LCD "stage". It dances, blinks and smiles. Tap it to make it jump, throw hearts and switch dance moves.
+- **Right:** a big pixel clock, the date and the current weather together, then this month's calendar with today highlighted.
+- **Ring notes** pop up as a Game Boy dialog box above the robot, typed out letter by letter. The robot waves and "talks" while it types, and the box shows whether the note reached Muse. Tap the box to close it.
+- **Tap any empty spot** to cycle color themes: Classic, Pocket, Ice, Sunset, Sakura, Virtual Boy and Matcha. **Long-press** anywhere to open Settings.
+
+Weather comes from [Open-Meteo](https://open-meteo.com/) (free, no key). By default the city is detected from your IP via geojs.io. You can set a city in Settings.
+
+### Settings
+
+Long-press the home screen to open them:
+
+| Tab | What's there |
+|---|---|
+| **Status** | Webhook URLs (home and Tailscale), send a test note, pairing and cloud-link status, live note feed. **⚙ Connection** holds the tokens and side-chat ID. |
+| **Home screen** | Weather city, °C/°F, 24-hour clock, seconds, week start, robot dancing, how long note bubbles stay, color theme, night dimming, burn-in protection |
+| **Screensaver** | Use as the Portal screensaver, keep the screen on, permission status |
+
+### Use it as the Portal screensaver
+
+Grant the permission once, then turn on **Settings → Screensaver → Use as Portal screensaver**:
+
+```bash
+adb shell pm grant com.portal.pebblebridge android.permission.WRITE_SECURE_SETTINGS
+```
+
+The app remembers your previous screensaver and restores it if you turn this off. The Portal's launcher resets the screensaver on boot, so the app re-applies it every few minutes.
+
 ## Endpoints
 
 | Path | Use |

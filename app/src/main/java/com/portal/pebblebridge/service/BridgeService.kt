@@ -24,6 +24,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 class BridgeService : Service() {
 
@@ -90,6 +91,15 @@ class BridgeService : Service() {
     museLinkClient?.start()
 
     registerNetworkCallback()
+
+    // The Portal launcher resets the screensaver on boot; keep ours registered if enabled.
+    com.portal.pebblebridge.home.HomePrefs.init(this)
+    serviceScope.launch {
+      while (true) {
+        com.portal.pebblebridge.home.ScreensaverGuard.apply(this@BridgeService)
+        kotlinx.coroutines.delay(5 * 60_000L)
+      }
+    }
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
