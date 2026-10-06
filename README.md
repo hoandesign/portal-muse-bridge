@@ -55,6 +55,8 @@ In the Pebble app: **Index 01 Settings → Webhook**, pick a gesture (e.g. *Hold
 
 Tap **Send test event**, then **Save**. Speak into the ring and the note shows up in Muse.
 
+Each note reaches Muse with a short line added at the end: *(Voice note from my Pebble ring, transcribed by speech-to-text. Some words may be misheard, so please work out what I most likely meant.)* That way Muse reads past transcription mistakes. The Portal shows only your words.
+
 ## 4. Use it away from home (Tailscale)
 
 The webhook URL above only works when your phone is on the same Wi-Fi as the Portal. [Tailscale](https://tailscale.com) gives the Portal a private address your phone can reach from anywhere (office, mobile data), without opening your router to the internet.

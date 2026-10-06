@@ -64,4 +64,10 @@ class HomeLogicTest {
     assertEquals("Hanoi, VN", places.single().label)
     assertEquals(21.02, places.single().lat, 0.001)
   }
+
+  @Test
+  fun `Muse message carries the transcription hint after the note`() {
+    val msg = com.portal.pebblebridge.muse.museMessage("  Buy milk  ")
+    assertEquals("Buy milk\n\n" + com.portal.pebblebridge.muse.TRANSCRIPTION_HINT, msg)
+  }
 }

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Notes sent to Muse now end with a short hint saying they are speech-to-text transcriptions that may contain misheard words, so Muse works out the intended meaning. The Portal still shows your original words.
+
 ## 1.1.0 — 2026-10-07
 
 ### Added

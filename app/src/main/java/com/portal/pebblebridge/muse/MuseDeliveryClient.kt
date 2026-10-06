@@ -43,7 +43,7 @@ class MuseDeliveryClient(
 
       // 1. If connected via Muse Noise WebSocket session, deliver note as /chat/stream
       if (linkClient != null && linkClient.linkState.value == LinkState.CONNECTED_ONLINE) {
-        val chatResult = linkClient.sendChat(note.text, config.museSessionId)
+        val chatResult = linkClient.sendChat(museMessage(note.text), config.museSessionId)
         if (chatResult.isSuccess) {
           return@withContext chatResult
         }
@@ -59,7 +59,7 @@ class MuseDeliveryClient(
           linkClient.linkState.first { it == LinkState.CONNECTED_ONLINE }
         }
         if (linkClient.linkState.value == LinkState.CONNECTED_ONLINE) {
-          val chatResult = linkClient.sendChat(note.text, config.museSessionId)
+          val chatResult = linkClient.sendChat(museMessage(note.text), config.museSessionId)
           if (chatResult.isSuccess) {
             return@withContext chatResult
           }
@@ -106,7 +106,7 @@ class MuseDeliveryClient(
     token: String,
   ): Result<String> {
     val jsonBody = JSONObject().apply {
-      put("message", note.text)
+      put("message", museMessage(note.text))
       if (!note.title.isNullOrBlank()) {
         put("title", note.title)
       }
@@ -198,3 +198,11 @@ class MuseDeliveryClient(
     }
   }
 }
+
+/** Appended to every note sent to Muse (not shown on the Portal), so Muse reads past STT errors. */
+const val TRANSCRIPTION_HINT =
+  "(Voice note from my Pebble ring, transcribed by speech-to-text. Some words may be misheard, " +
+    "so please work out what I most likely meant.)"
+
+/** The text Muse receives for a ring note: the transcription followed by [TRANSCRIPTION_HINT]. */
+fun museMessage(transcription: String): String = "${transcription.trim()}\n\n$TRANSCRIPTION_HINT"
