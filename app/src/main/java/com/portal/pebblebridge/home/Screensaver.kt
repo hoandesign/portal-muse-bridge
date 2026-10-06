@@ -73,6 +73,36 @@ object ScreensaverGuard {
     }
   }
 
+  private var lastReassertMs = 0L
+  private var observer: android.database.ContentObserver? = null
+
+  /**
+   * Some launchers (e.g. Immortal launcher) put their own screensaver back whenever their home
+   * screen resumes. Watch the setting and re-apply ours straight away, at most once every few
+   * seconds so two apps can't ping-pong forever.
+   */
+  fun watch(context: Context) {
+    if (observer != null) return
+    val app = context.applicationContext
+    val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    val obs = object : android.database.ContentObserver(handler) {
+      override fun onChange(selfChange: Boolean) {
+        if (!HomePrefs.settings.value.screensaverEnabled || isActive(app)) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastReassertMs < 5_000L) {
+          // Too soon: try once more after the cool-down instead of fighting.
+          handler.postDelayed({ if (!isActive(app)) apply(app) }, 5_000L)
+          return
+        }
+        lastReassertMs = now
+        Log.i(TAG, "screensaver changed to ${currentComponent(app)}; re-applying ours")
+        apply(app)
+      }
+    }
+    app.contentResolver.registerContentObserver(Settings.Secure.getUriFor(KEY_COMPONENTS), false, obs)
+    observer = obs
+  }
+
   const val GRANT_COMMAND =
     "adb shell pm grant com.portal.pebblebridge android.permission.WRITE_SECURE_SETTINGS"
 }

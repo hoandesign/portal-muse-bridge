@@ -94,6 +94,7 @@ class BridgeService : Service() {
 
     // The Portal launcher resets the screensaver on boot; keep ours registered if enabled.
     com.portal.pebblebridge.home.HomePrefs.init(this)
+    com.portal.pebblebridge.home.ScreensaverGuard.watch(this)
     serviceScope.launch {
       while (true) {
         com.portal.pebblebridge.home.ScreensaverGuard.apply(this@BridgeService)
