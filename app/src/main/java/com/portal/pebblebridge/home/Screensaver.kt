@@ -8,16 +8,35 @@ import android.service.dreams.DreamService
 import android.util.Log
 import com.portal.pebblebridge.ui.MainActivity
 
-/** Opens the pixel home screen when the Portal goes idle (same approach as portalani). */
+/**
+ * Opens the pixel home screen when the Portal goes idle (same approach as portalani).
+ *
+ * Some launchers (e.g. Immortal launcher with its photo frame off) wake the device ~20 ms after
+ * any dream starts, before onDreamingStarted runs. So launch from onCreate, the earliest hook;
+ * the activity stays open even if the dream itself is then stopped.
+ */
 class HomeDreamService : DreamService() {
+  private var launched = false
+
+  override fun onCreate() {
+    super.onCreate()
+    launchHome()
+  }
+
   override fun onDreamingStarted() {
     super.onDreamingStarted()
+    launchHome()
+    finish()
+  }
+
+  private fun launchHome() {
+    if (launched) return
+    launched = true
     startActivity(
       Intent(this, MainActivity::class.java)
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         .putExtra(MainActivity.EXTRA_DREAM_MODE, true),
     )
-    finish()
   }
 }
 
@@ -32,6 +51,7 @@ object ScreensaverGuard {
   private const val TAG = "ScreensaverGuard"
   const val COMPONENT = "com.portal.pebblebridge/com.portal.pebblebridge.home.HomeDreamService"
   private const val KEY_COMPONENTS = "screensaver_components"
+  private const val KEY_ENABLED = "screensaver_enabled"
   private const val PREFS = "screensaver_guard"
   private const val KEY_PREVIOUS = "previous_component"
 
@@ -42,7 +62,10 @@ object ScreensaverGuard {
   fun currentComponent(context: Context): String? =
     Settings.Secure.getString(context.contentResolver, KEY_COMPONENTS)
 
-  fun isActive(context: Context): Boolean = currentComponent(context) == COMPONENT
+  /** Ours is the screensaver and screensavers are switched on. */
+  fun isActive(context: Context): Boolean =
+    currentComponent(context) == COMPONENT &&
+      Settings.Secure.getInt(context.contentResolver, KEY_ENABLED, 0) == 1
 
   /** Applies the user's choice. Returns false when the permission is missing. */
   fun apply(context: Context, enabled: Boolean = HomePrefs.settings.value.screensaverEnabled): Boolean {
@@ -57,7 +80,7 @@ object ScreensaverGuard {
           Settings.Secure.putString(cr, KEY_COMPONENTS, COMPONENT)
           Log.i(TAG, "screensaver set to ours (was: $current)")
         }
-        Settings.Secure.putInt(cr, "screensaver_enabled", 1)
+        Settings.Secure.putInt(cr, KEY_ENABLED, 1)
         Settings.Secure.putInt(cr, "screensaver_activate_on_sleep", 1)
       } else if (current == COMPONENT) {
         val previous = prefs.getString(KEY_PREVIOUS, null)
@@ -78,8 +101,8 @@ object ScreensaverGuard {
 
   /**
    * Some launchers (e.g. Immortal launcher) put their own screensaver back whenever their home
-   * screen resumes. Watch the setting and re-apply ours straight away, at most once every few
-   * seconds so two apps can't ping-pong forever.
+   * screen resumes, or switch screensavers off entirely. Watch both settings and re-apply ours
+   * straight away, at most once every few seconds so two apps can't ping-pong forever.
    */
   fun watch(context: Context) {
     if (observer != null) return
@@ -95,11 +118,12 @@ object ScreensaverGuard {
           return
         }
         lastReassertMs = now
-        Log.i(TAG, "screensaver changed to ${currentComponent(app)}; re-applying ours")
+        Log.i(TAG, "screensaver changed to ${currentComponent(app)} (enabled=${Settings.Secure.getInt(app.contentResolver, KEY_ENABLED, 0)}); re-applying ours")
         apply(app)
       }
     }
     app.contentResolver.registerContentObserver(Settings.Secure.getUriFor(KEY_COMPONENTS), false, obs)
+    app.contentResolver.registerContentObserver(Settings.Secure.getUriFor(KEY_ENABLED), false, obs)
     observer = obs
   }
 
