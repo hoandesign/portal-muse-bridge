@@ -50,7 +50,7 @@ class HomeLogicTest {
   @Test
   fun `parses Open-Meteo current weather`() {
     val body = """{"current":{"temperature_2m":28.6,"weather_code":61,"is_day":0}}"""
-    val w = WeatherClient.parseCurrent(body, fahrenheit = false, place = "Ho Chi Minh City")
+    val w = WeatherClient.parseCurrent(body, fahrenheit = false, place = "Tokyo")
     assertEquals(29, w.temp)
     assertEquals(61, w.code)
     assertEquals(false, w.isDay)

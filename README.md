@@ -1,6 +1,8 @@
 # Portal Pebble Muse Bridge
 
-Turn a **Meta Portal** (1st gen, Android 9) into a **Muse gadget**, so voice notes from a **Pebble Index 01 ring** land in a **Muse AI** chat.
+Turn a **Meta Portal** (1st gen, Android 9) into a **Muse gadget**, so voice notes from a **Pebble Index 01 ring** land in a **Muse AI** chat. The Portal also gets a Game Boy–style home screen and screensaver, where an 8-bit robot shows each note as it arrives.
+
+![Pixel home screen: an 8-bit robot on a lit Game Boy screen next to a pixel clock, weather and the month calendar](docs/screenshots/home.png)
 
 ```mermaid
 flowchart LR
@@ -30,7 +32,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n com.portal.pebblebridge/.ui.MainActivity
 ```
 
-`.env` values are only defaults for a fresh install. After the first launch, change them in the app's **⚙ Settings**.
+`.env` values are only defaults for a fresh install. After the first launch, change them in the app: long-press the home screen to open **Settings**, then tap **⚙ Connection**.
 
 ## 2. Pair with Muse
 
@@ -40,7 +42,7 @@ adb shell am start -n com.portal.pebblebridge/.ui.MainActivity
 
 After pairing, the Portal opens its cloud link. **Expect 403 errors in the log for a few minutes after pairing or any app restart.** The edge accepts the link after roughly 2–7 minutes. If it never does, create a **new SDK token** and pair again.
 
-Optional: set a **side chat ID** (any new UUID) in ⚙ Settings so ring notes go to their own Muse chat instead of the main one.
+Optional: set a **side chat ID** (any new UUID) in **Settings → ⚙ Connection** so ring notes go to their own Muse chat instead of the main one.
 
 ## 3. Connect the Pebble ring (Index Webhook)
 
@@ -48,7 +50,7 @@ In the Pebble app: **Index 01 Settings → Webhook**, pick a gesture (e.g. *Hold
 
 | Field | Value |
 |---|---|
-| URL | `http://<portal-ip>:8787/ingest` (the Portal's Wi-Fi IP is shown on its screen) |
+| URL | `http://<portal-ip>:8787/ingest` (shown in **Settings → Status**) |
 | What to send | **Transcription only** (audio isn't needed and may exceed the 1 MB limit) |
 
 Tap **Send test event**, then **Save**. Speak into the ring and the note shows up in Muse.
@@ -78,18 +80,32 @@ Test by turning Wi-Fi off on your phone and recording a note over mobile data.
 
 ## Pixel home screen
 
-The app opens on a Game Boy–style home screen:
+The app opens on a Game Boy–style home screen. It uses one four-shade palette at a time and groups related things together (Gestalt): the robot with its speech bubble on the left, the time, date and weather together on the right, then the month below.
 
 - **Left:** an 8-bit robot on a lit LCD "stage". It dances, blinks and smiles. Tap it to make it jump, throw hearts and switch dance moves.
 - **Right:** a big pixel clock, the date and the current weather together, then this month's calendar with today highlighted.
 - **Ring notes** pop up as a Game Boy dialog box above the robot, typed out letter by letter. The robot waves and "talks" while it types, and the box shows whether the note reached Muse. Tap the box to close it.
 - **Tap any empty spot** to cycle color themes: Classic, Pocket, Ice, Sunset, Sakura, Virtual Boy and Matcha. **Long-press** anywhere to open Settings.
 
+| A ring note arrives | Tap the robot |
+|---|---|
+| ![A ring note typed out in a Game Boy dialog box above the robot, marked "Sent to Muse"](docs/screenshots/ring-note.png) | ![The robot jumping with happy eyes and hearts, saying "Let's dance!"](docs/screenshots/robot-tap.png) |
+
+**Color themes** (tap any empty spot to switch):
+
+| Classic | Pocket | Ice | Sunset |
+|---|---|---|---|
+| ![Classic](docs/screenshots/theme-classic.png) | ![Pocket](docs/screenshots/theme-pocket.png) | ![Ice](docs/screenshots/theme-ice.png) | ![Sunset](docs/screenshots/theme-sunset.png) |
+| **Sakura** | **Virtual Boy** | **Matcha** | |
+| ![Sakura](docs/screenshots/theme-sakura.png) | ![Virtual Boy](docs/screenshots/theme-virtual-boy.png) | ![Matcha](docs/screenshots/theme-matcha.png) | |
+
 Weather comes from [Open-Meteo](https://open-meteo.com/) (free, no key). By default the city is detected from your IP via geojs.io. You can set a city in Settings.
 
 ### Settings
 
 Long-press the home screen to open them:
+
+![Settings, Home screen tab: weather city, clock and calendar, robot and note options, color theme, display](docs/screenshots/settings.png)
 
 | Tab | What's there |
 |---|---|
@@ -105,7 +121,15 @@ Grant the permission once, then turn on **Settings → Screensaver → Use as Po
 adb shell pm grant com.portal.pebblebridge android.permission.WRITE_SECURE_SETTINGS
 ```
 
-The app remembers your previous screensaver and restores it if you turn this off. The Portal's launcher resets the screensaver on boot, so the app re-applies it every few minutes.
+The app remembers your previous screensaver and restores it if you turn this off. The Portal's launcher resets the screensaver on boot, so the app re-applies it every few minutes, and at once whenever another app changes it.
+
+To try it without waiting for the Portal to go idle:
+
+```bash
+adb shell am start -n com.android.systemui/.Somnambulator
+```
+
+**Third-party launchers.** Some launchers fight over the screensaver. Immortal launcher, for example, sets its own photo frame back, switches screensavers off when its photo frame is off, and wakes the Portal right after any screensaver starts. The app copes with all three: it re-applies its screensaver at once, and it opens the home screen the instant the screensaver is created. If the launcher's photo frame still covers the robot, turn the photo frame off in the launcher's settings.
 
 ## Endpoints
 
@@ -115,16 +139,19 @@ The app remembers your previous screensaver and restores it if you turn this off
 | `POST /api/mcp` | MCP (Streamable HTTP) with a `send_muse_note` tool, for agents |
 | `GET /health` | Status check |
 
-Set an **MCP token** in ⚙ Settings to require `Authorization: Bearer <token>` (or `X-Pebble-Token`) on `/ingest` and `/api/mcp`. In the Pebble webhook, add it as a header. Without a token, anyone who can reach the Portal can post notes.
+Set an **MCP token** in **Settings → ⚙ Connection** to require `Authorization: Bearer <token>` (or `X-Pebble-Token`) on `/ingest` and `/api/mcp`. In the Pebble webhook, add it as a header. Without a token, anyone who can reach the Portal can post notes.
 
 ## How it works
 
 - `ble/`: GATT server and community pairing v5 (ECDH, encrypted envelopes, `provision_v2`), mirroring the Linux SDK.
 - `muse/`: `fetch_vms`, token refresh, and the Noise XX WebSocket link to `wss://<noise_host>/v1/noise` (default `hatch.metaaivm.com`), `link.register`, and `/chat/stream`.
 - `server/`: a small HTTP server for `/ingest`, MCP and `/health`.
+- `home/`: home-screen settings, Open-Meteo weather with IP location, month-grid math, and the screensaver (`HomeDreamService`, `ScreensaverGuard`).
+- `ui/home/`: the pixel UI. `PixelRobot` is drawn in code from rectangles; `HomeScreen` holds the clock, calendar, weather and dialog box; `Pixel.kt` has the themes and fonts.
+- `ui/settings/`: the Home screen and Screensaver tabs.
 
 The protocol follows Meta's [muse-gadget-sdk](https://github.com/facebookincubator/muse-gadget-sdk) (Apache-2.0). If you have a Raspberry Pi, that SDK's `linux/examples/pebble_ring_bridge.py` is the officially supported way to do the same thing.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). The bundled pixel fonts, [Press Start 2P](https://fonts.google.com/specimen/Press+Start+2P) and [VT323](https://fonts.google.com/specimen/VT323) (VT323 covers Vietnamese), are under the SIL Open Font License; see [FONTS-OFL.txt](FONTS-OFL.txt).
