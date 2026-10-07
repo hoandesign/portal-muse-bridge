@@ -284,6 +284,9 @@ fun MuseSettingsPanel() {
         ToggleRow("Show Muse's answers", "After a ring note, the robot shows what Muse replied", s.showAnswers) { v ->
           HomePrefs.update { it.copy(showAnswers = v) }
         }
+        ToggleRow("Auto-play answers", "Show and speak each answer as it arrives, one after another. Off: they wait in History.", s.autoPlay) { v ->
+          HomePrefs.update { it.copy(autoPlay = v) }
+        }
         ToggleRow("Speak answers aloud", "Reads Muse's answers and messages with the Portal's speaker", s.speakAnswers) { v ->
           HomePrefs.update { it.copy(speakAnswers = v) }
         }

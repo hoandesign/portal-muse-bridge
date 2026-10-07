@@ -110,18 +110,35 @@ object Assistant {
       return
     }
     _state.value = State.Thinking("")
+    val id = java.util.UUID.randomUUID().toString()
+    History.add(HistoryEntry(id, System.currentTimeMillis(), HistoryEntry.Kind.VOICE, played = true))
     scope.launch {
       val link = MuseLinkClient.activeInstance
-      if (link == null) { fail("MUSE IS OFFLINE"); return@launch }
+      if (link == null) { History.update(id) { it.copy(status = HistoryEntry.Status.FAILED) }; fail("MUSE IS OFFLINE"); return@launch }
       val result = link.ask(null, pcmToWav(audio, SAMPLE_RATE), BridgeRepository.config.value.museSessionId) { u ->
-        _state.value = when {
-          u.text.isEmpty() && u.done -> State.Problem("NO ANSWER FROM MUSE")
-          u.text.isEmpty() -> State.Thinking(u.heard)
-          else -> State.Answer(u.heard, u.text, u.done)
+        if (u.heard.isNotBlank()) History.update(id) { it.copy(question = u.heard) }
+        when {
+          u.mergedInto != null -> {
+            History.update(id) { it.copy(status = HistoryEntry.Status.MERGED) }
+            _state.value = State.Idle
+          }
+          u.done && u.text.isBlank() -> {
+            History.update(id) { it.copy(status = HistoryEntry.Status.NO_ANSWER) }
+            fail("NO ANSWER FROM MUSE")
+          }
+          u.done -> {
+            // The finished answer plays through the queue (shown + spoken), like any other.
+            History.update(id) { it.copy(answer = u.text, status = HistoryEntry.Status.ANSWERED, played = false) }
+            _state.value = State.Idle
+            Playback.enqueue(id, force = true, front = true)
+          }
+          else -> _state.value = State.Thinking(u.heard)
         }
-        if (u.done && u.text.isNotBlank()) Speaker.speakIfEnabled(u.text)
       }
-      result.onFailure { fail("COULDN'T REACH MUSE") }
+      result.onFailure {
+        History.update(id) { it.copy(status = HistoryEntry.Status.FAILED) }
+        fail("COULDN'T REACH MUSE")
+      }
     }
   }
 

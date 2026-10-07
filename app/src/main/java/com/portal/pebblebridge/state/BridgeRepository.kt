@@ -1,5 +1,6 @@
 package com.portal.pebblebridge.state
 
+import com.portal.pebblebridge.home.HistoryEntry.Status as HStatus
 import android.content.Context
 import android.content.SharedPreferences
 import com.portal.pebblebridge.BuildConfig
@@ -145,6 +146,9 @@ object BridgeRepository {
   }
 
   fun addNote(note: VoiceNote) {
+    com.portal.pebblebridge.home.History.add(com.portal.pebblebridge.home.HistoryEntry(
+      id = note.id, time = note.timestampEpochMs, kind = com.portal.pebblebridge.home.HistoryEntry.Kind.RING,
+      question = note.text, status = com.portal.pebblebridge.home.HistoryEntry.Status.SENDING, played = true))
     _notes.update { current ->
       listOf(note) + current.take(99) // Keep last 100 notes
     }
@@ -156,6 +160,18 @@ object BridgeRepository {
     _notes.update { current ->
       current.map { if (it.id == id) it.copy(museReply = reply, replyDone = done) else it }
     }
+    if (done) {
+      com.portal.pebblebridge.home.History.update(id) {
+        it.copy(answer = reply, status = if (reply.isBlank()) HStatus.NO_ANSWER else HStatus.ANSWERED, played = reply.isBlank())
+      }
+      if (reply.isNotBlank()) com.portal.pebblebridge.home.Playback.enqueue(id)
+    }
+  }
+
+  /** Muse answered this note together with a later one, in that one's reply. */
+  fun markNoteMerged(id: String) {
+    _notes.update { current -> current.map { if (it.id == id) it.copy(replyDone = true) else it } }
+    com.portal.pebblebridge.home.History.update(id) { it.copy(status = com.portal.pebblebridge.home.HistoryEntry.Status.MERGED) }
   }
 
   fun updateNoteStatus(
@@ -168,6 +184,15 @@ object BridgeRepository {
       current.map { note ->
         if (note.id == id) {
           note.copy(status = status, museReply = reply?.takeIf { it.isNotBlank() } ?: note.museReply, error = error)
+            .also { updated ->
+              com.portal.pebblebridge.home.History.update(id) { e ->
+                when {
+                  updated.status == NoteStatus.FAILED -> e.copy(status = HStatus.FAILED)
+                  updated.status == NoteStatus.DELIVERED && e.status == HStatus.SENDING -> e.copy(status = HStatus.WAITING)
+                  else -> e
+                }
+              }
+            }
         } else {
           note
         }

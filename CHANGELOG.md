@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **History:** every ring note, voice question, answer, message and timer is saved (last 200, across restarts). Tap an entry to replay it.
+- **Auto play:** answers, messages and timers are shown and spoken one after another, with long answers split into pages. Tap the bubble to skip; switch auto play off in Settings → Muse.
+- **Several questions at once:** the app now follows several open questions. When Muse answers queued notes in one reply (seen on a real Muse), the earlier ones are marked "answered with the next one" instead of waiting forever.
 - Vietnamese answers are shown but not read aloud when the voice engine has no Vietnamese voice (the Portal's built-in engine doesn't), instead of an English voice mangling them.
 - The note added to transcriptions is now general (not tied to the Pebble ring): *(Transcribed from speech, so some words may be misheard. Please go by what I most likely meant.)*
 - **Muse's answers:** ring notes now show Muse's reply in the robot's bubble. Muse's answers are read from `/chat/subscribe`, matched to our message like hey-muse does.

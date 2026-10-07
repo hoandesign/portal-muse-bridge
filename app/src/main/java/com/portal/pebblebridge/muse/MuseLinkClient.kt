@@ -85,8 +85,8 @@ class MuseLinkClient(
   private val pendingRequests = ConcurrentHashMap<Long, PendingRequest>()
   /** Encrypt-and-send must stay in nonce order, from any thread. */
   private val sendLock = Any()
-  /** The question whose answer we're collecting from /chat/subscribe, if any. */
-  @Volatile private var currentTurn: MuseTurn? = null
+  /** The questions whose answers we're collecting from /chat/subscribe. */
+  private val router = TurnRouter()
 
   /** Collects one request stream's response until end of body. */
   class PendingRequest {
@@ -444,7 +444,7 @@ class MuseLinkClient(
               return@forEach
             }
             Log.v(TAG, "event ${e.event}")
-            if (e.event == "client.invoke") clientInvoke(e) else currentTurn?.add(e)
+            if (e.event == "client.invoke") clientInvoke(e) else router.add(e)
           }
         } catch (e: Exception) {
           Log.w(TAG, "bad chat event stream", e)
@@ -498,7 +498,11 @@ class MuseLinkClient(
   }
 
   /** What [ask] reports while Muse answers. */
-  data class AnswerUpdate(val heard: String, val text: String, val done: Boolean)
+  /**
+   * [mergedInto] is set (with done) when Muse answered this message together with a later one:
+   * the combined answer is reported to that later message.
+   */
+  data class AnswerUpdate(val heard: String, val text: String, val done: Boolean, val mergedInto: String? = null)
 
   /**
    * Sends a text message or a WAV voice note to Muse and returns once Muse acknowledges it.
@@ -528,7 +532,7 @@ class MuseLinkClient(
 
     // Register the turn before sending: its events can arrive before the acknowledgment.
     val turn = MuseTurn()
-    currentTurn = turn
+    router.open(turn)
     val request = PendingRequest()
     val sid = synchronized(sendLock) {
       val (sid, frames) = transport.startStreamRequest("POST", "/chat/stream", jsonHeaders())
@@ -548,19 +552,19 @@ class MuseLinkClient(
     val acked = withTimeoutOrNull(60_000L) { request.done.await() }
     pendingRequests.remove(sid)
     if (acked == null) {
-      if (currentTurn === turn) currentTurn = null
+      router.close(turn)
       return@withContext Result.failure(IOException("Muse did not acknowledge the message"))
     }
     if (request.status !in 200..299) {
-      if (currentTurn === turn) currentTurn = null
+      router.close(turn)
       return@withContext Result.failure(IOException("Muse refused the message: HTTP ${request.status}"))
     }
     val messageId = ackMessageId(request.body.toString("UTF-8"))
     if (messageId.isEmpty() || onAnswer == null) {
-      if (currentTurn === turn) currentTurn = null
+      router.close(turn)
       return@withContext Result.success(messageId)
     }
-    turn.acknowledged(messageId)
+    router.acknowledged(turn, messageId)
     scope.launch { followAnswer(turn, onAnswer) }
     Result.success(messageId)
   }
@@ -571,7 +575,7 @@ class MuseLinkClient(
     var shownText = ""
     var shownHeard = ""
     try {
-      while (currentTurn === turn) {
+      while (router.isOpen(turn)) {
         val text = turn.text()
         val heard = turn.heard
         val quiet = System.currentTimeMillis() - turn.lastEventAt
@@ -581,7 +585,9 @@ class MuseLinkClient(
           shownHeard = heard
           onAnswer(AnswerUpdate(heard, text, done = false))
         }
+        val merged = turn.mergedInto
         when {
+          merged != null -> { onAnswer(AnswerUpdate(heard, "", done = true, mergedInto = merged)); return }
           turn.whole() && quiet >= ANSWER_SETTLE_MS -> { onAnswer(AnswerUpdate(heard, text, done = true)); return }
           text.isEmpty() && elapsed > FIRST_REPLY_MS -> { onAnswer(AnswerUpdate(heard, "", done = true)); return }
           elapsed > TURN_CAP_MS -> { onAnswer(AnswerUpdate(heard, text, done = true)); return }
@@ -589,7 +595,7 @@ class MuseLinkClient(
         delay(250)
       }
     } finally {
-      if (currentTurn === turn) currentTurn = null
+      router.close(turn)
     }
   }
 

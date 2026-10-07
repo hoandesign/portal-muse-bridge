@@ -49,6 +49,9 @@ import com.portal.pebblebridge.home.DeviceEvent
 import com.portal.pebblebridge.home.DeviceEvents
 import com.portal.pebblebridge.home.Timers
 import com.portal.pebblebridge.muse.Speaker
+import com.portal.pebblebridge.home.History
+import com.portal.pebblebridge.home.HistoryEntry
+import com.portal.pebblebridge.home.Playback
 import com.portal.pebblebridge.home.HomePrefs
 import com.portal.pebblebridge.home.HomeSettings
 import com.portal.pebblebridge.home.MonthGrid
@@ -72,20 +75,6 @@ private val ROBOT_LINES = listOf(
   "BEEP BOOP!", "HI THERE!", "LET'S DANCE!", "*HAPPY BEEPS*", "TAP ME AGAIN!",
   "I LOVE YOUR RING!", "NEW MOVES UNLOCKED!", "BZZT... HELLO!",
 )
-
-/** What the speech bubble is showing. */
-private sealed class Bubble {
-  /** A Pebble ring note as it arrived. */
-  data class Note(val id: String) : Bubble()
-  /** Muse's answer to that note. */
-  data class Answer(val noteId: String) : Bubble()
-  /** The robot's own line after a tap. */
-  data class Robot(val text: String, val shownAt: Long) : Bubble()
-  /** A message from Muse (portal.show_message) or a timer/alarm ringing. */
-  data class Say(val title: String, val text: String, val shownAt: Long) : Bubble()
-  /** A hold-to-talk voice turn, driven by [Assistant.state]. */
-  object Voice : Bubble()
-}
 
 /** What a bubble looks like right now. */
 private data class BubbleView(val key: String, val label: String, val text: String, val footer: String)
@@ -124,102 +113,66 @@ fun HomeScreen(onOpenSettings: () -> Unit) {
     }
   }
 
-  // Speech bubble: a voice turn wins, then the newest event (ring note, its answer, a message
-  // from Muse, a timer). Robot lines fill in after taps.
+  // Speech bubble, in priority order: a live voice turn, the playback queue (answers, Muse's
+  // messages, timers, one after another), a ring note still waiting for its answer, a robot line.
   val context = androidx.compose.ui.platform.LocalContext.current
   val assistant by Assistant.state.collectAsState()
   val speaking by Speaker.speaking.collectAsState()
   val timers by Timers.timers.collectAsState()
-  var bubble by remember { mutableStateOf<Bubble?>(null) }
+  val playing by Playback.now.collectAsState()
+  val history by History.entries.collectAsState()
+  var robotLine by remember { mutableStateOf<Pair<String, Long>?>(null) }
+  var hiddenNotes by remember { mutableStateOf(setOf<String>()) }
   var typingDone by remember { mutableStateOf(false) }
   var celebrateKey by remember { mutableIntStateOf(0) }
-  var lastSeenNoteId by remember { mutableStateOf<String?>(null) }
-  val newest = notes.firstOrNull()
-  LaunchedEffect(newest?.id) {
-    if (newest == null || newest.id == lastSeenNoteId) return@LaunchedEffect
-    val firstLook = lastSeenNoteId == null
-    lastSeenNoteId = newest.id
-    val fresh = System.currentTimeMillis() - newest.timestampEpochMs < RECENT_NOTE_MS
-    if ((!firstLook || fresh) && bubble != Bubble.Voice) bubble = Bubble.Note(newest.id)
-  }
-  LaunchedEffect(assistant) {
-    if (assistant != Assistant.State.Idle) bubble = Bubble.Voice
-    else if (bubble == Bubble.Voice) bubble = null
-  }
+  var showHistory by remember { mutableStateOf(false) }
   LaunchedEffect(Unit) {
     DeviceEvents.events.collect { e ->
       when (e) {
-        is DeviceEvent.Say -> bubble = Bubble.Say(e.title, e.text, System.currentTimeMillis())
-        is DeviceEvent.Ring -> {
-          bubble = Bubble.Say(if (e.isAlarm) "ALARM" else "TIMER", "${e.label} IS DONE!", System.currentTimeMillis())
-          celebrateKey++
-        }
-        DeviceEvent.Celebrate -> celebrateKey++
+        is DeviceEvent.Ring, DeviceEvent.Celebrate -> celebrateKey++
       }
     }
   }
-
-  val noteOf = { id: String -> notes.firstOrNull { it.id == id } }
-  val view: BubbleView? = when (val b = bubble) {
-    is Bubble.Note -> noteOf(b.id)?.let { n ->
-      val footer = when (n.status) {
-        NoteStatus.PENDING -> "SENDING TO MUSE..."
-        NoteStatus.DELIVERED -> if (settings.showAnswers && n.museReply.isNullOrBlank()) "SENT TO MUSE · THINKING..." else "SENT TO MUSE"
-        NoteStatus.FAILED -> "COULDN'T SEND"
-      }
-      BubbleView("note-${n.id}", "YOUR RING", n.text, footer)
-    }
-    is Bubble.Answer -> noteOf(b.noteId)?.museReply?.takeIf { it.isNotBlank() }?.let { r ->
-      BubbleView("answer-${b.noteId}", "MUSE", r, if (noteOf(b.noteId)?.replyDone == true) "" else "...")
-    }
-    is Bubble.Robot -> BubbleView("robot-${b.shownAt}", "BOT", b.text, "")
-    is Bubble.Say -> BubbleView("say-${b.shownAt}", b.title, b.text, "")
-    Bubble.Voice -> when (val a = assistant) {
-      is Assistant.State.Listening -> BubbleView("voice-listen", "LISTENING", "Speak now... let go to send.", "")
-      is Assistant.State.Thinking -> BubbleView("voice-think", "YOU", a.heard.ifEmpty { "..." }, "MUSE IS THINKING...")
-      is Assistant.State.Answer -> BubbleView("voice-answer", "MUSE", a.text, if (a.done) "" else "...")
-      is Assistant.State.Problem -> BubbleView("voice-problem", "OOPS", a.message, "")
-      Assistant.State.Idle -> null
-    }
-    null -> null
+  // The newest ring note, while it waits for Muse (up to 3 minutes).
+  val waitingNote = history.firstOrNull()?.takeIf {
+    it.kind == HistoryEntry.Kind.RING && it.id !in hiddenNotes &&
+      it.status in setOf(HistoryEntry.Status.SENDING, HistoryEntry.Status.WAITING, HistoryEntry.Status.FAILED) &&
+      now.timeInMillis - it.time < 3 * 60_000L
   }
-  val bubbleText = view?.text
-  val answerReady = (bubble as? Bubble.Note)?.let { b -> noteOf(b.id)?.museReply?.isNotBlank() == true } == true
-
-  // A ring note hands over to Muse's answer once it has finished typing.
-  LaunchedEffect(bubble, typingDone, answerReady) {
-    val b = bubble as? Bubble.Note ?: return@LaunchedEffect
-    if (typingDone && answerReady && settings.showAnswers) {
-      delay(1_200L)
-      bubble = Bubble.Answer(b.id)
+  val view: BubbleView? = when {
+    assistant is Assistant.State.Listening -> BubbleView("voice-listen", "LISTENING", "Speak now... let go to send.", "")
+    assistant is Assistant.State.Thinking ->
+      BubbleView("voice-think", "YOU", (assistant as Assistant.State.Thinking).heard.ifEmpty { "..." }, "MUSE IS THINKING...")
+    assistant is Assistant.State.Problem -> BubbleView("voice-problem", "OOPS", (assistant as Assistant.State.Problem).message, "")
+    playing != null -> playing!!.let { p ->
+      val pageNote = if (p.pages.size > 1) "${p.page + 1}/${p.pages.size}" else ""
+      val queued = if (p.queued > 0) "+${p.queued} MORE" else ""
+      BubbleView("play-${p.historyId}-${p.page}", p.label, p.text, listOf(pageNote, queued).filter { it.isNotEmpty() }.joinToString("  "))
     }
-  }
-  // Safety net: no bubble outlives 5 minutes, even if an answer never finishes streaming.
-  LaunchedEffect(bubble) {
-    val b = bubble ?: return@LaunchedEffect
-    if (b == Bubble.Voice) return@LaunchedEffect
-    delay(5 * 60_000L)
-    if (bubble == b) bubble = null
-  }
-  // Auto-dismiss once everything has been typed out (and finished streaming).
-  val settled = when (val b = bubble) {
-    is Bubble.Answer -> noteOf(b.noteId)?.replyDone == true
-    Bubble.Voice -> (assistant as? Assistant.State.Answer)?.done == true
-    is Bubble.Note -> !(settings.showAnswers && noteOf(b.id)?.status == NoteStatus.DELIVERED && !answerReady)
-    else -> true
-  }
-  LaunchedEffect(bubble, typingDone, settled, speaking) {
-    val b = bubble ?: return@LaunchedEffect
-    if (!typingDone || !settled || speaking) return@LaunchedEffect
-    delay(
-      when (b) {
-        is Bubble.Robot -> 2_500L
-        is Bubble.Note -> if (settings.showAnswers) 90_000L else settings.bubbleSeconds * 1000L
-        else -> settings.bubbleSeconds * 1000L
+    waitingNote != null -> BubbleView(
+      "note-${waitingNote.id}", "YOUR RING", waitingNote.question,
+      when (waitingNote.status) {
+        HistoryEntry.Status.SENDING -> "SENDING TO MUSE..."
+        HistoryEntry.Status.FAILED -> "COULDN'T SEND"
+        else -> if (settings.showAnswers) "SENT TO MUSE · THINKING..." else "SENT TO MUSE"
       },
     )
-    if (b == Bubble.Voice) Assistant.dismiss()
-    bubble = null
+    robotLine != null -> BubbleView("robot-${robotLine!!.second}", "BOT", robotLine!!.first, "")
+    else -> null
+  }
+  val bubbleText = view?.text
+  // Robot lines are brief.
+  LaunchedEffect(robotLine, typingDone) {
+    if (robotLine != null && typingDone) { delay(2_500L); robotLine = null }
+  }
+  // A ring note that won't get a shown answer stays only for the usual time.
+  LaunchedEffect(waitingNote?.id, waitingNote?.status, typingDone) {
+    val n = waitingNote ?: return@LaunchedEffect
+    if (!typingDone) return@LaunchedEffect
+    if (!settings.showAnswers || n.status == HistoryEntry.Status.FAILED) {
+      delay(settings.bubbleSeconds * 1000L)
+      hiddenNotes = hiddenNotes + n.id
+    }
   }
 
   // Theme follows settings; tapping empty space cycles it and flashes the name.
@@ -273,7 +226,7 @@ fun HomeScreen(onOpenSettings: () -> Unit) {
           dancing = settings.robotDances,
           talking = (bubbleText != null && !typingDone) || speaking,
           onTap = {
-            if (bubble == null || bubble is Bubble.Robot) bubble = Bubble.Robot(ROBOT_LINES.random(), System.currentTimeMillis())
+            if (view == null || robotLine != null) robotLine = ROBOT_LINES.random() to System.currentTimeMillis()
           },
           listening = assistant is Assistant.State.Listening,
           thinking = assistant is Assistant.State.Thinking,
@@ -299,9 +252,12 @@ fun HomeScreen(onOpenSettings: () -> Unit) {
             footer = shown.footer,
             onTypingChanged = { typingDone = it },
             onDismiss = {
-              if (bubble == Bubble.Voice) Assistant.dismiss()
-              Speaker.stop()
-              bubble = null
+              when {
+                assistant != Assistant.State.Idle -> Assistant.dismiss()
+                playing != null -> Playback.skip()
+                waitingNote != null -> hiddenNotes = hiddenNotes + waitingNote.id
+                else -> robotLine = null
+              }
             },
           )
         }
@@ -332,13 +288,30 @@ fun HomeScreen(onOpenSettings: () -> Unit) {
         MonthCalendar(buildMonthGrid(now, settings.weekStartsMonday))
       }
     }
-    Text(
-      "TAP: THEME   HOLD: SETTINGS",
-      fontFamily = PixelFont,
-      fontSize = 9.sp,
-      color = GB.Dark,
-      modifier = Modifier.align(Alignment.BottomEnd).padding(end = 40.dp, bottom = 12.dp),
-    )
+    Row(
+      modifier = Modifier.align(Alignment.BottomEnd).padding(end = 40.dp, bottom = 6.dp),
+      verticalAlignment = Alignment.CenterVertically,
+    ) {
+      Text("TAP: THEME   HOLD: SETTINGS", fontFamily = PixelFont, fontSize = 9.sp, color = GB.Dark)
+      Spacer(Modifier.width(20.dp))
+      val unseen = History.unseen(history)
+      PixelFrame(
+        modifier = Modifier.combinedClickableNoRipple { showHistory = true },
+        fill = if (unseen > 0) GB.Light else Color.Transparent,
+        outer = GB.Dark,
+        inner = GB.Dark,
+        border = 3.dp,
+      ) {
+        Text(
+          if (unseen > 0) "HISTORY · $unseen NEW" else "HISTORY",
+          modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+          fontFamily = PixelFont,
+          fontSize = 10.sp,
+          color = if (unseen > 0) GB.Darkest else GB.Light,
+        )
+      }
+    }
+    if (showHistory) HistoryScreen(history, onClose = { showHistory = false })
     if (themeFlashAt != 0L) {
       PixelFrame(
         modifier = Modifier.align(Alignment.Center),
@@ -654,5 +627,100 @@ private fun TimersRow(timers: List<com.portal.pebblebridge.home.PortalTimer>, no
       Spacer(Modifier.width(12.dp))
       Text("+${timers.size - 1}", fontFamily = PixelFont, fontSize = 12.sp, color = GB.Dark)
     }
+  }
+}
+
+/** Every note, question and answer, newest first. Tap one to show and hear it again. */
+@Composable
+private fun HistoryScreen(entries: List<HistoryEntry>, onClose: () -> Unit) {
+  var confirmClear by remember { mutableStateOf(false) }
+  androidx.activity.compose.BackHandler(onBack = onClose)
+  Box(
+    Modifier
+      .fillMaxSize()
+      .background(GB.Darkest)
+      .combinedClickableNoRipple {}, // swallow taps so they don't change the theme behind
+  ) {
+    LcdTexture(GB.Dark.copy(alpha = 0.12f))
+    Column(Modifier.fillMaxSize().padding(horizontal = 40.dp, vertical = 28.dp)) {
+      Row(verticalAlignment = Alignment.CenterVertically) {
+        PixelButton("◀ BACK", onClose)
+        Spacer(Modifier.width(24.dp))
+        Text("HISTORY", fontFamily = PixelFont, fontSize = 22.sp, color = GB.Lightest)
+        Spacer(Modifier.weight(1f))
+        Text("TAP AN ENTRY TO PLAY IT", fontFamily = PixelFont, fontSize = 9.sp, color = GB.Dark)
+        Spacer(Modifier.width(20.dp))
+        if (entries.isNotEmpty()) PixelButton(if (confirmClear) "SURE? CLEAR ALL" else "CLEAR") {
+          if (confirmClear) { History.clear(); confirmClear = false } else confirmClear = true
+        }
+      }
+      Spacer(Modifier.height(18.dp))
+      if (entries.isEmpty()) {
+        Text("NOTHING YET. SPEAK INTO YOUR RING OR HOLD THE ROBOT.", fontFamily = PixelFont, fontSize = 12.sp, color = GB.Light)
+      }
+      androidx.compose.foundation.lazy.LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        items(entries.size, key = { entries[it].id }) { i -> HistoryRow(entries[i]) }
+      }
+    }
+  }
+}
+
+private val TIME_FORMAT = java.text.SimpleDateFormat("EEE HH:mm", java.util.Locale.ENGLISH)
+
+@Composable
+private fun HistoryRow(e: HistoryEntry) {
+  val canPlay = e.answer.isNotBlank()
+  PixelFrame(
+    modifier = Modifier.fillMaxWidth().combinedClickableNoRipple { if (canPlay) Playback.playNow(e.id) },
+    fill = if (!e.played && canPlay) GB.Dark else Color.Transparent,
+    outer = GB.Dark,
+    inner = GB.Dark,
+    border = 3.dp,
+  ) {
+    Column(Modifier.padding(horizontal = 20.dp, vertical = 14.dp)) {
+      Row(verticalAlignment = Alignment.CenterVertically) {
+        val kind = when (e.kind) {
+          HistoryEntry.Kind.RING -> "RING"
+          HistoryEntry.Kind.VOICE -> "VOICE"
+          HistoryEntry.Kind.MESSAGE -> "MUSE MESSAGE"
+          HistoryEntry.Kind.TIMER -> e.question.ifEmpty { "TIMER" }
+        }
+        Text(kind, fontFamily = PixelFont, fontSize = 10.sp, color = GB.Light)
+        Spacer(Modifier.width(14.dp))
+        Text(TIME_FORMAT.format(java.util.Date(e.time)).uppercase(), fontFamily = PixelFont, fontSize = 10.sp,
+          color = if (!e.played && canPlay) GB.Light else GB.Dark)
+        Spacer(Modifier.weight(1f))
+        val status = when (e.status) {
+          HistoryEntry.Status.SENDING -> "SENDING..."
+          HistoryEntry.Status.WAITING -> "WAITING FOR MUSE..."
+          HistoryEntry.Status.MERGED -> "ANSWERED WITH THE NEXT ONE"
+          HistoryEntry.Status.FAILED -> "COULDN'T SEND"
+          HistoryEntry.Status.NO_ANSWER -> "NO ANSWER"
+          HistoryEntry.Status.ANSWERED -> if (!e.played) "NEW ▶" else "▶ PLAY"
+        }
+        Text(status, fontFamily = PixelFont, fontSize = 10.sp, color = if (!e.played && canPlay) GB.Lightest else GB.Light)
+      }
+      if (e.question.isNotBlank() && e.kind != HistoryEntry.Kind.TIMER && e.kind != HistoryEntry.Kind.MESSAGE) {
+        Spacer(Modifier.height(6.dp))
+        Text("> " + e.question, fontFamily = TerminalFont, fontSize = 24.sp, color = GB.Light, maxLines = 3, overflow = TextOverflow.Ellipsis)
+      }
+      if (e.answer.isNotBlank()) {
+        Spacer(Modifier.height(4.dp))
+        Text(e.answer, fontFamily = TerminalFont, fontSize = 26.sp, color = GB.Lightest, maxLines = 4, overflow = TextOverflow.Ellipsis)
+      }
+    }
+  }
+}
+
+@Composable
+private fun PixelButton(label: String, onClick: () -> Unit) {
+  PixelFrame(
+    modifier = Modifier.combinedClickableNoRipple(onClick = onClick),
+    fill = GB.Light,
+    outer = GB.Lightest,
+    inner = GB.Dark,
+    border = 3.dp,
+  ) {
+    Text(label, modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp), fontFamily = PixelFont, fontSize = 11.sp, color = GB.Darkest)
   }
 }

@@ -96,12 +96,19 @@ class BridgeService : Service() {
     com.portal.pebblebridge.home.HomePrefs.init(this)
     com.portal.pebblebridge.home.ScreensaverGuard.watch(this)
     com.portal.pebblebridge.muse.Speaker.init(this)
+    com.portal.pebblebridge.home.History.init(this)
     com.portal.pebblebridge.muse.PortalCommands.init(this)
     // Timers and alarms set by Muse ring here, whatever screen is showing.
     serviceScope.launch {
       while (true) {
         for (t in com.portal.pebblebridge.home.Timers.takeDue()) {
           com.portal.pebblebridge.home.DeviceEvents.emit(com.portal.pebblebridge.home.DeviceEvent.Ring(t.label, t.isAlarm))
+          val hid = java.util.UUID.randomUUID().toString()
+          com.portal.pebblebridge.home.History.add(com.portal.pebblebridge.home.HistoryEntry(
+            hid, System.currentTimeMillis(), com.portal.pebblebridge.home.HistoryEntry.Kind.TIMER,
+            question = if (t.isAlarm) "ALARM" else "TIMER", answer = "${t.label} is done!",
+            status = com.portal.pebblebridge.home.HistoryEntry.Status.ANSWERED))
+          com.portal.pebblebridge.home.Playback.enqueue(hid, force = true)
           ringTone()
         }
         kotlinx.coroutines.delay(1_000L)

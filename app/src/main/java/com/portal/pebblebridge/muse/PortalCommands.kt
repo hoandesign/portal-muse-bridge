@@ -49,8 +49,11 @@ object PortalCommands {
     ) { p ->
       val text = p.optString("text").trim().ifEmpty { throw CommandError("text is empty") }
       val title = p.optString("title").trim().uppercase().take(16).ifEmpty { "MUSE" }
-      DeviceEvents.emit(DeviceEvent.Say(text.take(600), title))
-      Speaker.speakIfEnabled(text)
+      val id = java.util.UUID.randomUUID().toString()
+      com.portal.pebblebridge.home.History.add(com.portal.pebblebridge.home.HistoryEntry(
+        id, System.currentTimeMillis(), com.portal.pebblebridge.home.HistoryEntry.Kind.MESSAGE,
+        question = title, answer = text.take(2000), status = com.portal.pebblebridge.home.HistoryEntry.Status.ANSWERED))
+      com.portal.pebblebridge.home.Playback.enqueue(id)
       ok("Shown on the Portal.")
     },
     PortalCommand(

@@ -140,6 +140,8 @@ Ideas and protocol details here come from [hey-muse](https://github.com/wobsoria
 - **Answers on screen.** After a ring note, the robot's bubble shows what Muse replied ("MUSE: …"). The app reads answers from Muse's `/chat/subscribe` stream; `/chat/stream` only acknowledges a message.
 - **Talk to Muse.** Hold the robot, speak, and let go. The Portal records 16 kHz WAV and sends it to Muse as a voice note, which Muse transcribes. The robot shows what Muse heard, then the answer. Grant the microphone once: `adb shell pm grant com.portal.pebblebridge android.permission.RECORD_AUDIO`.
 - **Spoken answers.** Answers and messages are read aloud with Android text-to-speech, using the Portal's built-in voice (English, French, German, Italian, Spanish). It has no Vietnamese voice, so Vietnamese answers are shown on screen but not read aloud. **Settings → Muse** shows the voice engine's status.
+- **Auto play and History.** Finished answers, Muse's messages and timers play one after another (shown and spoken), so a new one never cuts off the last. Long answers flip through pages. Tap the bubble to skip. Everything is kept in **HISTORY** (bottom-right of the home screen, last 200, saved across restarts); tap an entry to play it again. Turn auto play off in **Settings → Muse** and answers wait in History with a "new" count.
+- **Several notes at once.** When notes queue up, Muse answers them together in one reply. The app shows that answer once and marks the earlier notes "answered with the next one".
 - **Muse controls the Portal.** The Portal tells Muse which commands it offers, and Muse calls them when you ask (for example "set a 10 minute tea timer on my Portal"):
 
 | Command | What it does |

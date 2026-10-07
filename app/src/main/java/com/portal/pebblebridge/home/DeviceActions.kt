@@ -12,8 +12,6 @@ import kotlinx.coroutines.flow.update
 
 /** Things the home screen reacts to, from Muse commands or timers. */
 sealed class DeviceEvent {
-  /** Muse asked the robot to say something. */
-  data class Say(val text: String, val title: String = "MUSE") : DeviceEvent()
   /** A timer or alarm went off. */
   data class Ring(val label: String, val isAlarm: Boolean) : DeviceEvent()
   /** Muse asked the robot to celebrate. */

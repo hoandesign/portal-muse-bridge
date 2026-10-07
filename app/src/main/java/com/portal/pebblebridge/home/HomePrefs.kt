@@ -35,6 +35,8 @@ data class HomeSettings(
   val holdToTalk: Boolean = true,
   /** Let Muse run Portal commands (messages, timers, volume, theme). */
   val museCommands: Boolean = true,
+  /** Show and speak answers one after another as they arrive; off keeps them in History. */
+  val autoPlay: Boolean = true,
 )
 
 object HomePrefs {
@@ -55,6 +57,7 @@ object HomePrefs {
   private const val K_SPEAK = "speak_answers"
   private const val K_TALK = "hold_to_talk"
   private const val K_COMMANDS = "muse_commands"
+  private const val K_AUTOPLAY = "auto_play"
 
   val BUBBLE_CHOICES = listOf(15, 30, 60, 120, 300)
 
@@ -84,6 +87,7 @@ object HomePrefs {
       speakAnswers = p.getBoolean(K_SPEAK, d.speakAnswers),
       holdToTalk = p.getBoolean(K_TALK, d.holdToTalk),
       museCommands = p.getBoolean(K_COMMANDS, d.museCommands),
+      autoPlay = p.getBoolean(K_AUTOPLAY, d.autoPlay),
     )
   }
 
@@ -107,6 +111,7 @@ object HomePrefs {
       putBoolean(K_SPEAK, s.speakAnswers)
       putBoolean(K_TALK, s.holdToTalk)
       putBoolean(K_COMMANDS, s.museCommands)
+      putBoolean(K_AUTOPLAY, s.autoPlay)
       apply()
     }
   }

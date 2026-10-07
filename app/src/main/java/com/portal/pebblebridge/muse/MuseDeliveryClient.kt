@@ -35,8 +35,10 @@ class MuseDeliveryClient(
 
   /** Muse's answer to a ring note: stored on the note (shown by the robot) and read aloud when done. */
   private fun answerHandler(noteId: String): (MuseLinkClient.AnswerUpdate) -> Unit = { u ->
-    if (u.text.isNotBlank()) BridgeRepository.updateNoteReply(noteId, u.text, u.done)
-    if (u.done && u.text.isNotBlank()) Speaker.speakIfEnabled(u.text)
+    when {
+      u.mergedInto != null -> BridgeRepository.markNoteMerged(noteId)
+      u.text.isNotBlank() || u.done -> BridgeRepository.updateNoteReply(noteId, u.text, u.done)
+    }
   }
 
   suspend fun deliverNote(

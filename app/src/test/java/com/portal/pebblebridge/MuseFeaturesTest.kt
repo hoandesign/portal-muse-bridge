@@ -6,6 +6,10 @@ import com.portal.pebblebridge.muse.ChatEvent
 import com.portal.pebblebridge.muse.ControlDecoder
 import com.portal.pebblebridge.muse.LineBuffer
 import com.portal.pebblebridge.muse.MuseTurn
+import com.portal.pebblebridge.muse.TurnRouter
+import com.portal.pebblebridge.home.History
+import com.portal.pebblebridge.home.HistoryEntry
+import com.portal.pebblebridge.home.Playback
 import com.portal.pebblebridge.muse.PortalCommands
 import com.portal.pebblebridge.muse.Speaker
 import com.portal.pebblebridge.muse.ackMessageId
@@ -52,32 +56,84 @@ class MuseFeaturesTest {
 
   private fun ev(event: String, payload: String) = ChatEvent.parse("""{"type":"event","event":"$event","payload":$payload}""")!!
 
-  @Test fun `turn collects the answer that follows our message, even if events beat the ack`() {
-    val t = MuseTurn()
-    // Events race the acknowledgment: our message echoes, then the reply starts.
-    t.add(ev("message.user", """{"message_id":"m1","display_text":"what time is it\n[file:audio/wav x.wav]"}"""))
-    t.add(ev("delta.message_start", """{"message_id":"r1","parent_message_id":"m1"}"""))
-    t.add(ev("delta.text_append", """{"message_id":"r1","text":"It's "}"""))
-    t.acknowledged("m1")
-    t.add(ev("delta.text_append", """{"message_id":"r1","text":"noon."}"""))
+  @Test fun `answer is routed to our question even when events beat the ack`() {
+    val r = TurnRouter(); val t = MuseTurn(); r.open(t)
+    r.add(ev("message.user", """{"message_id":"m1","display_text":"what time is it\n[file:audio/wav x.wav]"}"""), 1)
+    r.add(ev("delta.message_start", """{"message_id":"r1"}"""), 2)
+    r.add(ev("delta.text_append", """{"message_id":"r1","text":"It's "}"""), 3)
+    r.acknowledged(t, "m1", 4)
+    r.add(ev("delta.text_append", """{"message_id":"r1","text":"noon."}"""), 5)
     assertEquals("what time is it", t.heard)
     assertEquals("It's noon.", t.text())
     assertFalse(t.whole())
-    t.add(ev("delta.message_done", """{"message_id":"r1"}"""))
+    r.add(ev("delta.message_done", """{"message_id":"r1"}"""), 6)
     assertTrue(t.whole())
   }
 
-  @Test fun `turn ignores other people's messages and waits while Muse is busy`() {
-    val t = MuseTurn()
-    t.acknowledged("m1")
-    t.add(ev("message.user", """{"message_id":"other","display_text":"hi"}"""))
-    t.add(ev("agent.status", """{"activity_code":"thinking"}"""))
-    t.add(ev("message.assistant", """{"message_id":"r1","display_text":"Done"}"""))
+  @Test fun `two queued notes answered in one reply - the earlier is marked merged`() {
+    // The sequence captured from Muse: ack A, echo A, ack B, echo B, then ONE reply naming neither.
+    val r = TurnRouter(); val a = MuseTurn(); val b = MuseTurn()
+    r.open(a); r.acknowledged(a, "A")
+    r.add(ev("message.user", """{"message_id":"A","display_text":"fruit?"}"""))
+    r.open(b); r.acknowledged(b, "B")
+    r.add(ev("message.user", """{"message_id":"B","display_text":"color?"}"""))
+    r.add(ev("agent.status", """{"activity_code":"responding"}"""))
+    r.add(ev("delta.message_start", """{"message_id":"R"}"""))
+    r.add(ev("delta.text_append", """{"message_id":"R","parent_message_id":"R","text":"Apple and blue."}"""))
+    r.add(ev("agent.status", """{"activity_code":"online"}"""))
+    r.add(ev("delta.message_done", """{"message_id":"R"}"""))
+    assertEquals("B", a.mergedInto)
+    assertEquals("", a.text())
+    assertEquals("Apple and blue.", b.text())
+    assertTrue(b.whole())
+  }
+
+  @Test fun `a reply already streaming stays with its question when another is asked`() {
+    val r = TurnRouter(); val a = MuseTurn(); val b = MuseTurn()
+    r.open(a); r.acknowledged(a, "A")
+    r.add(ev("delta.message_start", """{"message_id":"RA"}"""))
+    r.add(ev("delta.text_append", """{"message_id":"RA","text":"First "}"""))
+    r.open(b)
+    r.add(ev("delta.text_append", """{"message_id":"RA","text":"answer."}""")) // B not acked yet
+    r.acknowledged(b, "B")
+    r.add(ev("delta.message_done", """{"message_id":"RA"}"""))
+    r.add(ev("delta.message_start", """{"message_id":"RB"}"""))
+    r.add(ev("delta.text_append", """{"message_id":"RB","text":"Second."}"""))
+    assertEquals("First answer.", a.text())
+    assertEquals(null, a.mergedInto)
+    assertEquals("Second.", b.text())
+  }
+
+  @Test fun `other people's messages are ignored`() {
+    val r = TurnRouter(); val t = MuseTurn(); r.open(t); r.acknowledged(t, "m1")
+    r.add(ev("message.user", """{"message_id":"other","display_text":"hi"}"""))
+    r.add(ev("agent.status", """{"activity_code":"thinking"}"""))
+    r.add(ev("message.assistant", """{"message_id":"r1","display_text":"Done"}"""))
     assertEquals("", t.heard)
     assertEquals("Done", t.text())
     assertFalse("busy holds the turn open", t.whole())
-    t.add(ev("agent.status", """{"activity_code":"idle"}"""))
+    r.add(ev("agent.status", """{"activity_code":"idle"}"""))
     assertTrue(t.whole())
+  }
+
+  @Test fun `long answers flip through pages at word boundaries`() {
+    val words = List(60) { "word$it" }.joinToString(" ")
+    val pages = Playback.paginate(words, max = 50)
+    assertTrue(pages.size > 1)
+    assertTrue(pages.all { it.length <= 50 })
+    assertEquals(words, pages.joinToString(" "))
+    assertEquals(listOf("short"), Playback.paginate("  short \n\n "))
+  }
+
+  @Test fun `history survives a restart and unfinished questions become no-answer`() {
+    val list = listOf(
+      HistoryEntry("1", 10, HistoryEntry.Kind.RING, "hi", "hello", HistoryEntry.Status.ANSWERED, played = false),
+      HistoryEntry("2", 20, HistoryEntry.Kind.VOICE, "q", "", HistoryEntry.Status.WAITING),
+    )
+    val back = History.decode(History.encode(list))
+    assertEquals(list[0], back[0])
+    assertEquals(HistoryEntry.Status.NO_ANSWER, back[1].status)
+    assertEquals(1, History.unseen(back))
   }
 
   @Test fun `ack message id is read from either shape`() {

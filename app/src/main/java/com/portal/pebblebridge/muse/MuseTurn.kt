@@ -67,17 +67,14 @@ class ChatEvent(val json: JSONObject) {
 }
 
 /**
- * One question and the answer adding up to it. Port of hey-muse's `turn.go`: Muse never links its
- * answer to the question, so any message that starts after ours (after the stream echoes our
- * message, or after the acknowledgment) belongs to this turn.
+ * One question and the answer adding up to it (after hey-muse's `turn.go`). Which events belong
+ * to which question is decided by [TurnRouter], since several questions can be open at once.
  */
 class MuseTurn {
   private class Reply(val id: String, var text: String = "", var done: Boolean = false)
 
   var messageId: String = ""
     private set
-  private val pending = mutableListOf<ChatEvent>()
-  private var oursSeen = false
   private val replies = mutableListOf<Reply>()
   /** Muse saying it is still working, which holds the turn open through a pause. */
   private var busy = false
@@ -86,51 +83,36 @@ class MuseTurn {
     private set
   var lastEventAt: Long = System.currentTimeMillis()
     private set
+  /** Set when Muse answered this question together with a later one, in that one's reply. */
+  @Volatile var mergedInto: String? = null
 
-  @Synchronized
-  fun add(e: ChatEvent, now: Long = System.currentTimeMillis()) {
+  @Synchronized fun acknowledged(id: String) { messageId = id }
+
+  @Synchronized fun status(e: ChatEvent, now: Long) {
     lastEventAt = now
-    when (e.event) {
-      "agent.status", "task.status" -> {
-        val activity = e.payload.opt("activity_code") as? String
-        val status = e.payload.opt("status") as? String
-        busy = when {
-          !activity.isNullOrEmpty() -> activity != "online" && activity != "idle"
-          !status.isNullOrEmpty() -> status != "completed" && status != "failed"
-          else -> busy
-        }
-      }
-      "message.user", "delta.message_start", "delta.text_append", "delta.message_done", "message.assistant" ->
-        if (messageId.isNotEmpty()) apply(e, afterAck = true) else if (pending.size < 256) pending += e
+    val activity = e.payload.opt("activity_code") as? String
+    val status = e.payload.opt("status") as? String
+    busy = when {
+      !activity.isNullOrEmpty() -> activity != "online" && activity != "idle"
+      !status.isNullOrEmpty() -> status != "completed" && status != "failed"
+      else -> busy
     }
   }
 
-  /** Our message's id from the /chat/stream acknowledgment; replays what arrived before it. */
-  @Synchronized
-  fun acknowledged(id: String) {
-    messageId = id
-    pending.forEach { apply(it, afterAck = false) }
-    pending.clear()
+  /** Muse's copy of our message; for a voice note its text is the transcript. */
+  @Synchronized fun user(e: ChatEvent, now: Long) {
+    lastEventAt = now
+    val said = transcript(e.str("display_text"))
+    if (said.isNotEmpty() && e.ready) heard = said
   }
 
-  private fun apply(e: ChatEvent, afterAck: Boolean) {
+  @Synchronized fun owns(replyId: String) = replies.any { it.id == replyId }
+  @Synchronized fun hasReplies() = replies.isNotEmpty()
+
+  @Synchronized fun reply(e: ChatEvent, now: Long) {
+    lastEventAt = now
     val id = e.messageId
-    if (e.event == "message.user") {
-      if (id != messageId) return
-      oursSeen = true
-      val said = transcript(e.str("display_text"))
-      if (said.isNotEmpty() && e.ready) heard = said
-      return
-    }
-    var reply = replies.firstOrNull { it.id == id }
-    if (reply == null) {
-      if (e.event == "delta.text_append") return
-      val parent = e.str("reply_to_message_id").ifEmpty { e.str("parent_message_id") }
-      val linked = parent.isNotEmpty() && (parent == messageId || replies.any { it.id == parent })
-      val follows = parent.isEmpty() && (oursSeen || afterAck)
-      if (!(linked || follows) || replies.size >= 32) return
-      reply = Reply(id).also { replies += it }
-    }
+    val reply = replies.firstOrNull { it.id == id } ?: Reply(id).also { if (replies.size < 32) replies += it }
     when (e.event) {
       "delta.message_start" -> Unit
       "delta.text_append" -> reply.text = (reply.text + e.str("text")).take(MAX_TEXT)
@@ -156,6 +138,64 @@ class MuseTurn {
     /** A stored voice note's text is the words then a "[file:audio/wav …]" line; keep the words. */
     fun transcript(display: String): String =
       display.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("[file:") }.joinToString(" ")
+  }
+}
+
+/**
+ * Routes /chat/subscribe events to the open questions. Several can be open at once (two quick
+ * ring notes, or a voice question while a note's answer streams).
+ *
+ * Seen on a real Muse: when two messages are queued, Muse answers them in ONE reply that names
+ * neither. So a new reply goes to the newest question still waiting, and older waiting questions
+ * are marked [MuseTurn.mergedInto] it. A reply that already started stays with its question.
+ * Events are held while any open question still lacks its id (they can beat the acknowledgment).
+ */
+class TurnRouter {
+  private val open = mutableListOf<MuseTurn>()
+  private val pending = mutableListOf<ChatEvent>()
+
+  @Synchronized fun open(t: MuseTurn) { open += t }
+  @Synchronized fun close(t: MuseTurn) { open -= t; if (open.isEmpty()) pending.clear() }
+  @Synchronized fun isOpen(t: MuseTurn) = t in open
+  @Synchronized fun openCount() = open.size
+
+  @Synchronized fun acknowledged(t: MuseTurn, id: String, now: Long = System.currentTimeMillis()) {
+    t.acknowledged(id)
+    val held = pending.toList()
+    pending.clear()
+    held.forEach { if (!route(it, now) && pending.size < 256) pending += it }
+  }
+
+  @Synchronized fun add(e: ChatEvent, now: Long = System.currentTimeMillis()) {
+    if (open.isEmpty()) return
+    if (!route(e, now) && pending.size < 256) pending += e
+  }
+
+  /** False when the event must wait for an acknowledgment. */
+  private fun route(e: ChatEvent, now: Long): Boolean {
+    val unacked = open.any { it.messageId.isEmpty() }
+    when (e.event) {
+      "agent.status", "task.status" -> open.forEach { it.status(e, now) }
+      "message.user" -> {
+        val t = open.firstOrNull { it.messageId == e.messageId } ?: return !unacked
+        t.user(e, now)
+      }
+      "delta.message_start", "delta.text_append", "delta.message_done", "message.assistant" -> {
+        val id = e.messageId
+        open.firstOrNull { it.owns(id) }?.let { it.reply(e, now); return true }
+        val parent = e.str("reply_to_message_id").ifEmpty { e.str("parent_message_id") }
+        if (parent.isNotEmpty() && parent != id) {
+          open.firstOrNull { it.messageId == parent || it.owns(parent) }?.let { it.reply(e, now); return true }
+        }
+        if (unacked) return false
+        if (e.event == "delta.text_append") return true // the start of a reply we don't follow
+        val waiting = open.filter { !it.hasReplies() && it.mergedInto == null }
+        val owner = waiting.lastOrNull() ?: return true // not an answer to us
+        waiting.dropLast(1).forEach { it.mergedInto = owner.messageId }
+        owner.reply(e, now)
+      }
+    }
+    return true
   }
 }
 
