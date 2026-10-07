@@ -176,6 +176,21 @@ Set an **MCP token** in **Settings → ⚙ Connection** to require `Authorizatio
 
 The protocol follows Meta's [muse-gadget-sdk](https://github.com/facebookincubator/muse-gadget-sdk) (Apache-2.0). If you have a Raspberry Pi, that SDK's `linux/examples/pebble_ring_bridge.py` is the officially supported way to do the same thing.
 
+## Credits
+
+This app stands on what these projects worked out. Thank you to their authors.
+
+| Project | What we learned or used |
+|---|---|
+| [facebookincubator/muse-gadget-sdk](https://github.com/facebookincubator/muse-gadget-sdk) (Apache-2.0) | The reference for everything Muse: BLE community pairing v5, `provision_v2`, the Noise XX link to `/v1/noise`, `link.register` with `commands_v2`, `link.invoke`/`link.result`, `/chat/stream`. The protocol code here is a Kotlin port of its Linux SDK. Its issues #51 and #79 explained the Android "Can't connect" failures. |
+| [wobsoriano/hey-muse](https://github.com/wobsoriano/hey-muse) (MIT) | Turns an Echo Show into a Muse voice gadget. From it: Muse's answers arrive on `/chat/subscribe`, not on the `/chat/stream` response; how to match an answer to its question (`MuseTurn` is a port of its `turn.go`); `client.invoke` on the chat stream; voice notes as WAV attachments; the idea of device commands and spoken answers. |
+| [hypery11/muse-gadget-everywhere](https://github.com/hypery11/muse-gadget-everywhere) | Runs the upstream SDK on Android hardware. Its `BleTransport` showed the Android GATT details we were missing: waiting for `onNotificationSent` between packets, a readable TX characteristic, and offering one Wi-Fi entry. |
+| [hoandesign/portalani](https://github.com/hoandesign/portalani) | The Portal screensaver approach (`DreamService` + `screensaver_components`) and the Open-Meteo weather client. |
+| [ram-nat/portal-gphotos](https://github.com/ram-nat/portal-gphotos) | The original Portal screensaver technique that portalani builds on. |
+| [Press Start 2P](https://fonts.google.com/specimen/Press+Start+2P), [VT323](https://fonts.google.com/specimen/VT323) | Pixel fonts (SIL OFL, see [FONTS-OFL.txt](FONTS-OFL.txt)). |
+
+Not affiliated with Meta, Core Devices, or the authors above.
+
 ## License
 
 MIT, see [LICENSE](LICENSE). The bundled pixel fonts, [Press Start 2P](https://fonts.google.com/specimen/Press+Start+2P) and [VT323](https://fonts.google.com/specimen/VT323) (VT323 covers Vietnamese), are under the SIL Open Font License; see [FONTS-OFL.txt](FONTS-OFL.txt).

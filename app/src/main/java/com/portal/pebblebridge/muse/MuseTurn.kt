@@ -67,7 +67,8 @@ class ChatEvent(val json: JSONObject) {
 }
 
 /**
- * One question and the answer adding up to it (after hey-muse's `turn.go`). Which events belong
+ * One question and the answer adding up to it. Ported from hey-muse's `turn.go`
+ * (https://github.com/wobsoriano/hey-muse, MIT), which extends Meta's Muse Gadget SDK (Apache-2.0). Which events belong
  * to which question is decided by [TurnRouter], since several questions can be open at once.
  */
 class MuseTurn {
