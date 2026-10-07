@@ -194,10 +194,10 @@ class MuseBleProtocolTest {
     val scanEntries = manager.getWifiScanEntries()
     assertTrue("Scan entries must not be empty", scanEntries.isNotEmpty())
 
-    // Must contain CURRENT_CONNECTION_LABEL as an open fallback entry
-    val openFallback = scanEntries.find { it.ssid == MuseBleManager.CURRENT_CONNECTION_LABEL }
-    assertNotNull("Open fallback entry 'Use current connection' must be present", openFallback)
-    assertFalse("Fallback 'Use current connection' must be open (secure=false)", openFallback!!.secure)
+    // Exactly one entry, the active network (SDK network.current_connection_entry). Offering the
+    // placeholder next to a real SSID stalls the Muse Android app (muse-gadget-sdk#79).
+    assertEquals("Exactly one Wi-Fi entry", 1, scanEntries.size)
+    assertEquals(activeSsid, scanEntries.single().ssid)
 
     // First entry must have valid SSID, negative RSSI, and be marked open (secure=false) per Meta SDK network.py
     val firstEntry = scanEntries.first()

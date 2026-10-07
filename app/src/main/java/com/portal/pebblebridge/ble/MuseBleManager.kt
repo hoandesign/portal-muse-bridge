@@ -148,6 +148,9 @@ class MuseBleManager(
     const val PAIRED_FLAG_COMPANY_ID = 0xFFFF
 
     const val CHUNK_MAGIC = 0xFE.toByte()
+    /** Gap between chunks, like the SDK's `CHUNK_STAGGER_S`. */
+    const val CHUNK_STAGGER_MS = 20L
+    const val NOTIFY_TIMEOUT_MS = 2_000L
     const val HEADER_BYTES = 3
     const val MAX_PACKET_BYTES = 160
     const val MAX_MESSAGE_BYTES = 8192
@@ -255,6 +258,8 @@ class MuseBleManager(
   private val chunkAssemblers = ConcurrentHashMap<BluetoothDevice, ChunkAssembler>()
   private val rxMutexes = ConcurrentHashMap<String, Mutex>()
   private val txMutex = Mutex()
+  /** Completed by onNotificationSent; Android allows one outstanding notification at a time. */
+  @Volatile private var notifySent: kotlinx.coroutines.CompletableDeferred<Int>? = null
 
   private val btReceiver = object : BroadcastReceiver() {
     override fun onReceive(c: Context?, intent: Intent?) {
@@ -522,6 +527,10 @@ class MuseBleManager(
         gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_READ_NOT_PERMITTED, offset, null)
       }
 
+      override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+        notifySent?.complete(status)
+      }
+
       override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
         Log.i(TAG, "Device ${device.address} MTU changed: $mtu")
         deviceMtus[device.address] = mtu
@@ -643,7 +652,7 @@ class MuseBleManager(
     // TX Characteristic (Device notifies to Phone)
     val txChar = BluetoothGattCharacteristic(
       TX_UUID,
-      BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+      BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
       BluetoothGattCharacteristic.PERMISSION_READ
     )
     val cccd = BluetoothGattDescriptor(
@@ -1068,19 +1077,14 @@ class MuseBleManager(
     val secure: Boolean
   )
 
-  fun getWifiScanEntries(): List<WifiScanEntry> {
-    val activeSsid = getActiveWifiSsid()
-    val primarySsid = if (activeSsid.isNotBlank() && activeSsid != CURRENT_CONNECTION_LABEL) {
-      activeSsid
-    } else {
-      CURRENT_CONNECTION_LABEL
-    }
-    val entries = mutableListOf(WifiScanEntry(primarySsid, -35, secure = false))
-    if (primarySsid != CURRENT_CONNECTION_LABEL) {
-      entries.add(WifiScanEntry(CURRENT_CONNECTION_LABEL, -40, secure = false))
-    }
-    return entries
-  }
+  /**
+   * One entry, exactly like the SDK's `network.current_connection_entry()`: the real SSID (the
+   * Portal is already online), marked open so the app skips the password. The placeholder label
+   * is only a last resort: the Muse Android app never sends `provision_v2` after the user picks
+   * it (muse-gadget-sdk#79), so it must not be offered next to the real network.
+   */
+  fun getWifiScanEntries(): List<WifiScanEntry> =
+    listOf(WifiScanEntry(getActiveWifiSsid(), -40, secure = false))
 
   private suspend fun sendJson(device: BluetoothDevice, json: JSONObject) {
     val bytes = json.toString().toByteArray(StandardCharsets.UTF_8)
@@ -1151,8 +1155,10 @@ class MuseBleManager(
     }
 
     txMutex.withLock {
-      for (packet in packets) {
+      for ((index, packet) in packets.withIndex()) {
         char.value = packet
+        val sent = kotlinx.coroutines.CompletableDeferred<Int>()
+        notifySent = sent
         val notified = try {
           gattServer?.notifyCharacteristicChanged(device, char, false) ?: false
         } catch (e: Exception) {
@@ -1170,9 +1176,17 @@ class MuseBleManager(
           }
           if (!retried) {
             Log.w(TAG, "GATT notification packet dropped after retry for ${device.address}")
+            continue
           }
         }
-        delay(50) // Non-blocking coroutine delay per chunk (§CHUNK_STAGGER_S)
+        // Like muse-gadget-everywhere's BleTransport: don't send the next packet until Android
+        // confirms this one, or the stack silently drops it and the phone's reassembly stalls.
+        val status = kotlinx.coroutines.withTimeoutOrNull(NOTIFY_TIMEOUT_MS) { sent.await() }
+        when {
+          status == null -> Log.w(TAG, "No onNotificationSent for packet ${index + 1}/${packets.size} within ${NOTIFY_TIMEOUT_MS}ms")
+          status != BluetoothGatt.GATT_SUCCESS -> Log.w(TAG, "Notification ${index + 1}/${packets.size} failed: status=$status")
+        }
+        if (index < packets.lastIndex) delay(CHUNK_STAGGER_MS)
       }
     }
   }
