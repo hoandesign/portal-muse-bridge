@@ -133,6 +133,26 @@ adb shell am start -n com.android.systemui/.Somnambulator
 
 **Third-party launchers.** Some launchers fight over the screensaver. Immortal launcher, for example, sets its own photo frame back, switches screensavers off when its photo frame is off, and wakes the Portal right after any screensaver starts. The app copes with all three: it re-applies its screensaver at once, and it opens the home screen the instant the screensaver is created. If the launcher's photo frame still covers the robot, turn the photo frame off in the launcher's settings.
 
+## Muse on the Portal
+
+Ideas and protocol details here come from [hey-muse](https://github.com/wobsoriano/hey-muse), which turns an Echo Show into a Muse voice gadget.
+
+- **Answers on screen.** After a ring note, the robot's bubble shows what Muse replied ("MUSE: …"). The app reads answers from Muse's `/chat/subscribe` stream; `/chat/stream` only acknowledges a message.
+- **Talk to Muse.** Hold the robot, speak, and let go. The Portal records 16 kHz WAV and sends it to Muse as a voice note, which Muse transcribes. The robot shows what Muse heard, then the answer. Grant the microphone once: `adb shell pm grant com.portal.pebblebridge android.permission.RECORD_AUDIO`.
+- **Spoken answers.** Answers and messages are read aloud with Android text-to-speech, in Vietnamese when the text is Vietnamese and the voice engine supports it. The Portal needs a text-to-speech app installed; **Settings → Muse** shows whether one is ready.
+- **Muse controls the Portal.** The Portal tells Muse which commands it offers, and Muse calls them when you ask (for example "set a 10 minute tea timer on my Portal"):
+
+| Command | What it does |
+|---|---|
+| `portal.show_message` | Shows a message in the robot's bubble and reads it aloud |
+| `portal.start_timer`, `portal.set_alarm` | Timers and alarms; they ring with beeps and a bubble, and count down under the date |
+| `portal.list_timers`, `portal.cancel_timers` | List or cancel timers and alarms |
+| `portal.set_volume` | Sets the Portal's volume (0–100) |
+| `portal.set_theme` | Switches the color theme |
+| `portal.celebrate` | Makes the robot jump and cheer |
+
+Nothing here runs shell commands, reads files or reaches other devices. Turn any of this off in **Settings → Muse**. Changing the command switch reconnects to Muse, which takes a few minutes.
+
 ## Endpoints
 
 | Path | Use |

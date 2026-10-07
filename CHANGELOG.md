@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Muse's answers:** ring notes now show Muse's reply in the robot's bubble. Muse's answers are read from `/chat/subscribe`, matched to our message like hey-muse does.
+- **Talk to Muse:** hold the robot to record a voice note; the robot shows what Muse heard and its answer.
+- **Spoken answers:** answers and messages are read aloud with Android text-to-speech, in Vietnamese when the text is Vietnamese.
+- **Portal commands for Muse:** `show_message`, timers and alarms, volume, theme, `celebrate`.
+- **New Muse tab in Settings:** switches for each feature, voice engine and microphone status, running timers.
+- **Android pairing fixes:** a single Wi-Fi entry (muse-gadget-sdk#79), notifications paced by `onNotificationSent`, and a readable TX characteristic.
 - Notes sent to Muse now end with a short hint saying they are speech-to-text transcriptions that may contain misheard words, so Muse works out the intended meaning. The Portal still shows your original words.
 
 ## 1.1.0 — 2026-10-07
