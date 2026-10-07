@@ -151,6 +151,13 @@ object BridgeRepository {
     _serverStatus.update { it.copy(totalNotesReceived = it.totalNotesReceived + 1) }
   }
 
+  /** Muse's answer to a note, as it streams in. */
+  fun updateNoteReply(id: String, reply: String, done: Boolean) {
+    _notes.update { current ->
+      current.map { if (it.id == id) it.copy(museReply = reply, replyDone = done) else it }
+    }
+  }
+
   fun updateNoteStatus(
     id: String,
     status: NoteStatus,
@@ -160,7 +167,7 @@ object BridgeRepository {
     _notes.update { current ->
       current.map { note ->
         if (note.id == id) {
-          note.copy(status = status, museReply = reply, error = error)
+          note.copy(status = status, museReply = reply?.takeIf { it.isNotBlank() } ?: note.museReply, error = error)
         } else {
           note
         }

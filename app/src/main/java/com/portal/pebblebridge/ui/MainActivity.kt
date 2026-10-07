@@ -96,15 +96,13 @@ class MainActivity : ComponentActivity() {
     hideSystemBars()
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-      if (checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-        requestPermissions(
-          arrayOf(
-            android.Manifest.permission.ACCESS_FINE_LOCATION,
-            android.Manifest.permission.ACCESS_COARSE_LOCATION
-          ),
-          1001
-        )
-      }
+      // Location for BLE; the microphone for "hold the robot to talk".
+      val wanted = listOf(
+        android.Manifest.permission.ACCESS_FINE_LOCATION,
+        android.Manifest.permission.ACCESS_COARSE_LOCATION,
+        android.Manifest.permission.RECORD_AUDIO,
+      ).filter { checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED }
+      if (wanted.isNotEmpty()) requestPermissions(wanted.toTypedArray(), 1001)
     }
 
     setContent {
@@ -241,13 +239,14 @@ fun BridgeScreen(
   ) { padding ->
     Column(modifier = Modifier.fillMaxSize().padding(padding)) {
     androidx.compose.material3.TabRow(selectedTabIndex = tab, containerColor = Color(0xFF18181B)) {
-      listOf("Status", "Home screen", "Screensaver").forEachIndexed { i, label ->
+      listOf("Status", "Home screen", "Muse", "Screensaver").forEachIndexed { i, label ->
         androidx.compose.material3.Tab(selected = tab == i, onClick = { tab = i }, text = { Text(label, fontSize = 15.sp) })
       }
     }
     when (tab) {
       1 -> com.portal.pebblebridge.ui.settings.HomeSettingsPanel()
-      2 -> com.portal.pebblebridge.ui.settings.ScreensaverSettingsPanel()
+      2 -> com.portal.pebblebridge.ui.settings.MuseSettingsPanel()
+      3 -> com.portal.pebblebridge.ui.settings.ScreensaverSettingsPanel()
       else -> Row(
       modifier = Modifier
         .fillMaxSize()

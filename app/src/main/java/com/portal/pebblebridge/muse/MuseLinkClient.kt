@@ -22,8 +22,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
@@ -50,6 +48,10 @@ class MuseLinkClient(
     private const val TAG = "MuseLinkClient"
     private const val DEFAULT_NOISE_HOST = "hatch.metaaivm.com"
     private const val APP_ID = "musegadget"
+    private const val BODY_CHUNK = 16 * 1024
+    private const val ANSWER_SETTLE_MS = 3_000L
+    private const val FIRST_REPLY_MS = 3 * 60_000L
+    private const val TURN_CAP_MS = 6 * 60_000L
 
     @Volatile
     var activeInstance: MuseLinkClient? = null
@@ -73,13 +75,34 @@ class MuseLinkClient(
 
   @Volatile
   private var noiseTransport: NoiseTransport? = null
-  private var controlStreamId: Long = 0
-  private val pendingRequests = ConcurrentHashMap<Long, CompletableDeferred<String>>()
-  private val txMutex = Mutex()
+  private var controlStreamId: Long = -1
+  private var subscribeStreamId: Long = -1
+  @Volatile private var subscribeOpen = false
+  private var registerId = ""
+  private var controlDecoder = ControlDecoder()
+  private var subscribeLines = LineBuffer()
+  /** Request streams waiting for their whole response (e.g. the /chat/stream acknowledgment). */
+  private val pendingRequests = ConcurrentHashMap<Long, PendingRequest>()
+  /** Encrypt-and-send must stay in nonce order, from any thread. */
+  private val sendLock = Any()
+  /** The question whose answer we're collecting from /chat/subscribe, if any. */
+  @Volatile private var currentTurn: MuseTurn? = null
+
+  /** Collects one request stream's response until end of body. */
+  class PendingRequest {
+    var status = 0
+    val body = java.io.ByteArrayOutputStream()
+    val done = CompletableDeferred<Unit>()
+  }
 
   private fun setLinkState(state: LinkState) {
     _linkState.value = state
     BridgeRepository.updateMuseLinkState(state)
+  }
+
+  /** Drops the connection so the loop reconnects and re-registers (e.g. new command list). */
+  fun reconnect() {
+    activeWebSocket?.close(1000, "re-register")
   }
 
   fun triggerReconnect() {
@@ -314,8 +337,9 @@ class MuseLinkClient(
 
   private fun openControlStream(ws: WebSocket) {
     val transport = noiseTransport ?: return
-    val (streamId, frames) = transport.startStreamRequest("POST", "/link-control")
+    val (streamId, frames) = synchronized(sendLock) { transport.startStreamRequest("POST", "/link-control") }
     controlStreamId = streamId
+    controlDecoder = ControlDecoder()
 
     // Send HTTP stream start frames
     for (frame in frames) {
@@ -339,92 +363,233 @@ class MuseLinkClient(
         put("device_family", "homehub")
         put("model_id", "portal")
         put("is_wakeup_supported", false)
-        put("commands_v2", JSONObject())
+        put("commands_v2", PortalCommands.registerSpec())
       })
     }
+    this.registerId = registerId
+    sendControl(ws, registerObj)
+    Log.i(TAG, "Sent link.register as $currentNodeId ($currentDisplayName) with ${PortalCommands.registerSpec().length()} commands")
+    openSubscribe(ws)
+  }
 
-    val registerBytes = registerObj.toString().toByteArray(Charsets.UTF_8)
-    val prefixed = NoiseTransport.encodeLengthPrefixedMessage(registerBytes)
-    val chunkFrames = transport.encryptBodyChunk(streamId, prefixed)
-    for (frame in chunkFrames) {
-      ws.send(frame.toByteString())
+  /** Length-prefixed JSON on the control stream (link.register, link.result). */
+  private fun sendControl(ws: WebSocket, message: JSONObject) {
+    val transport = noiseTransport ?: return
+    synchronized(sendLock) {
+      val prefixed = NoiseTransport.encodeLengthPrefixedMessage(message.toString().toByteArray(Charsets.UTF_8))
+      transport.encryptBodyChunk(controlStreamId, prefixed).forEach { ws.send(it.toByteString()) }
     }
-    Log.i(TAG, "Sent link.register as $currentNodeId ($currentDisplayName) on streamId=$streamId")
+  }
+
+  private fun jsonHeaders(vararg extra: NoiseHeader) = listOf(
+    NoiseHeader("Content-Type", "application/json"),
+    NoiseHeader("x-request-id", UUID.randomUUID().toString()),
+    NoiseHeader("x-app-id", APP_ID),
+  ) + extra
+
+  /**
+   * Opens /chat/subscribe: a response that never ends, one JSON event per line. Muse's answers
+   * arrive here, not on the /chat/stream request (which only acknowledges). From hey-muse.
+   */
+  private fun openSubscribe(ws: WebSocket) {
+    val transport = noiseTransport ?: return
+    synchronized(sendLock) {
+      val (sid, frames) = transport.startStreamRequest("POST", "/chat/subscribe", jsonHeaders(NoiseHeader("accept", "application/x-ndjson")))
+      subscribeStreamId = sid
+      subscribeLines = LineBuffer()
+      subscribeOpen = true
+      frames.forEach { ws.send(it.toByteString()) }
+      transport.encryptBodyChunk(sid, "{}".toByteArray(), endBody = true).forEach { ws.send(it.toByteString()) }
+    }
+    Log.i(TAG, "Opened /chat/subscribe on stream $subscribeStreamId")
   }
 
   private fun handleInboundFrame(frame: ServiceFrame) {
-    when (val p = frame.payload) {
-      is ServiceFramePayload.Resp -> {
-        Log.i(TAG, "Received ApplicationResponse: status=${p.response.status}")
-        val deferred = pendingRequests.remove(frame.streamId)
-        val bodyText = if (frame.streamId == controlStreamId) {
-          NoiseTransport.decodeLengthPrefixedMessage(p.response.body)?.toString(Charsets.UTF_8)
-            ?: String(p.response.body, Charsets.UTF_8)
-        } else {
-          String(p.response.body, Charsets.UTF_8)
+    val (status, data, ended) = when (val p = frame.payload) {
+      is ServiceFramePayload.Resp -> Triple(p.response.status, p.response.body, p.response.endBody)
+      is ServiceFramePayload.Chunk -> Triple(0, p.chunk.data, p.chunk.endBody)
+      is ServiceFramePayload.Reset -> {
+        Log.w(TAG, "stream ${frame.streamId} reset: ${p.reason}")
+        when (frame.streamId) {
+          controlStreamId -> activeWebSocket?.close(1000, "control stream reset")
+          subscribeStreamId -> subscribeOpen = false
+          else -> pendingRequests.remove(frame.streamId)?.done?.completeExceptionally(IOException("stream reset: ${p.reason}"))
         }
-        deferred?.complete(bodyText)
+        return
       }
-      is ServiceFramePayload.Chunk -> {
-        val deferred = pendingRequests.remove(frame.streamId)
-        val chunkText = if (frame.streamId == controlStreamId) {
-          NoiseTransport.decodeLengthPrefixedMessage(p.chunk.data)?.toString(Charsets.UTF_8)
-            ?: String(p.chunk.data, Charsets.UTF_8)
-        } else {
-          String(p.chunk.data, Charsets.UTF_8)
-        }
-        deferred?.complete(chunkText)
-      }
-      else -> {}
+      else -> return
     }
-  }
-
-  suspend fun sendChat(message: String, sessionId: String = ""): Result<String> = withContext(Dispatchers.IO) {
-    val ws = activeWebSocket ?: return@withContext Result.failure(IOException("Not connected to Muse cloud"))
-    val transport = noiseTransport ?: return@withContext Result.failure(IOException("Noise transport not ready"))
-
-    try {
-      val (streamId, deferred) = txMutex.withLock {
-        val currentNodeId = BridgeRepository.nodeId.ifBlank { "homelink-e1890c" }
-        val reqBody = JSONObject().apply {
-          put("message", message)
-          put("output_modality", "text")
-          put("device_id", currentNodeId)
-          if (sessionId.isNotBlank()) {
-            put("session_id", sessionId)
+    when (frame.streamId) {
+      controlStreamId -> {
+        if (status >= 400) Log.w(TAG, "/link-control refused: HTTP $status")
+        try {
+          controlDecoder.feed(data).forEach(::handleControl)
+        } catch (e: Exception) {
+          Log.w(TAG, "bad control stream data", e)
+        }
+      }
+      subscribeStreamId -> {
+        if (status >= 400) {
+          Log.w(TAG, "/chat/subscribe refused: HTTP $status")
+          subscribeOpen = false
+          return
+        }
+        try {
+          subscribeLines.feed(data).forEach { line ->
+            val e = ChatEvent.parse(line) ?: return@forEach
+            if (e.event == "client.invoke") clientInvoke(e) else currentTurn?.add(e)
           }
-        }.toString().toByteArray(Charsets.UTF_8)
-
-        val headers = listOf(
-          NoiseHeader("Content-Type", "application/json"),
-          NoiseHeader("x-request-id", UUID.randomUUID().toString()),
-          NoiseHeader("x-app-id", APP_ID)
-        )
-
-        val (sid, frames) = transport.startStreamRequest("POST", "/chat/stream", headers)
-        val chunkFrames = transport.encryptBodyChunk(sid, reqBody, endBody = true)
-
-        val d = CompletableDeferred<String>()
-        pendingRequests[sid] = d
-
-        for (f in frames) ws.send(f.toByteString())
-        for (f in chunkFrames) ws.send(f.toByteString())
-
-        Pair(sid, d)
+        } catch (e: Exception) {
+          Log.w(TAG, "bad chat event stream", e)
+          subscribeOpen = false
+        }
+        if (ended) subscribeOpen = false
       }
-
-      val reply = try {
-        withTimeoutOrNull(45_000L) {
-          deferred.await()
-        } ?: "Voice note delivered to Muse AI"
-      } finally {
-        pendingRequests.remove(streamId)
+      else -> pendingRequests[frame.streamId]?.let { r ->
+        if (status != 0) r.status = status
+        r.body.write(data)
+        if (ended) {
+          pendingRequests.remove(frame.streamId)
+          r.done.complete(Unit)
+        }
       }
-
-      Result.success(reply)
-    } catch (e: Exception) {
-      Log.e(TAG, "Failed to send chat to Muse", e)
-      Result.failure(e)
     }
   }
+
+  private fun handleControl(m: JSONObject) {
+    val method = m.optString("method")
+    when {
+      m.optString("id") == registerId && method.isEmpty() -> {
+        val err = m.opt("error")
+        if (err != null && err != JSONObject.NULL && err != false) Log.e(TAG, "link.register rejected: $err")
+        else Log.i(TAG, "Registered with Muse")
+      }
+      m.optString("event") in setOf("link.unpaired", "node.unpaired") ->
+        Log.w(TAG, "Muse removed this device (${m.optString("event")})")
+      method == "link.invoke" && m.optString("id").isNotEmpty() ->
+        runInvoke(m.optString("id"), m.optString("command"), m.optJSONObject("params"))
+    }
+  }
+
+  /** A command from a turn started by this device arrives on the chat stream instead (hey-muse). */
+  private fun clientInvoke(e: ChatEvent) {
+    val id = e.str("invoke_id").ifEmpty { return }
+    val params = runCatching { JSONObject(e.str("params_json")) }.getOrNull()
+    runInvoke(id, e.str("command_id"), params)
+  }
+
+  private fun runInvoke(id: String, command: String, params: JSONObject?) {
+    scope.launch {
+      Log.i(TAG, "invoke $command")
+      val result = withContext(Dispatchers.Main) { PortalCommands.invoke(command, params) }
+      val ws = activeWebSocket ?: return@launch
+      val msg = JSONObject().put("method", "link.result").put("id", id)
+      result.keys().forEach { k -> msg.put(k, result.get(k)) }
+      sendControl(ws, msg)
+      Log.i(TAG, "$command -> ${if (result.optBoolean("ok")) "ok" else result.optString("error")}")
+    }
+  }
+
+  /** What [ask] reports while Muse answers. */
+  data class AnswerUpdate(val heard: String, val text: String, val done: Boolean)
+
+  /**
+   * Sends a text message or a WAV voice note to Muse and returns once Muse acknowledges it.
+   * Muse's answer is then collected from /chat/subscribe and reported through [onAnswer]
+   * (on a background thread) until it is complete, like hey-muse's `ask`.
+   */
+  suspend fun ask(
+    text: String?,
+    wav: ByteArray? = null,
+    sessionId: String = "",
+    onAnswer: ((AnswerUpdate) -> Unit)? = null,
+  ): Result<String> = withContext(Dispatchers.IO) {
+    val ws = activeWebSocket ?: return@withContext Result.failure(IOException("Not connected to Muse"))
+    val transport = noiseTransport ?: return@withContext Result.failure(IOException("Noise transport not ready"))
+    if (!subscribeOpen) openSubscribe(ws)
+
+    val nodeId = BridgeRepository.nodeId.ifBlank { "homelink-e1890c" }
+    val body = JSONObject().apply {
+      if (text != null) put("message", text)
+      put("output_modality", "text")
+      put("device_id", nodeId)
+      if (sessionId.isNotBlank()) put("session_id", sessionId)
+      if (wav != null) put("items", org.json.JSONArray().put(JSONObject()
+        .put("type", "file").put("mime_type", "audio/wav").put("filename", "voice_note.wav")
+        .put("data_base64", android.util.Base64.encodeToString(wav, android.util.Base64.NO_WRAP))))
+    }.toString().toByteArray(Charsets.UTF_8)
+
+    // Register the turn before sending: its events can arrive before the acknowledgment.
+    val turn = MuseTurn()
+    currentTurn = turn
+    val request = PendingRequest()
+    val sid = synchronized(sendLock) {
+      val (sid, frames) = transport.startStreamRequest("POST", "/chat/stream", jsonHeaders())
+      pendingRequests[sid] = request
+      frames.forEach { ws.send(it.toByteString()) }
+      // Big bodies (voice notes) go in 16 KiB pieces, like the firmware.
+      var start = 0
+      do {
+        val end = minOf(body.size, start + BODY_CHUNK)
+        transport.encryptBodyChunk(sid, body.copyOfRange(start, end), endBody = end == body.size)
+          .forEach { ws.send(it.toByteString()) }
+        start = end
+      } while (start < body.size)
+      sid
+    }
+
+    val acked = withTimeoutOrNull(60_000L) { request.done.await() }
+    pendingRequests.remove(sid)
+    if (acked == null) {
+      if (currentTurn === turn) currentTurn = null
+      return@withContext Result.failure(IOException("Muse did not acknowledge the message"))
+    }
+    if (request.status !in 200..299) {
+      if (currentTurn === turn) currentTurn = null
+      return@withContext Result.failure(IOException("Muse refused the message: HTTP ${request.status}"))
+    }
+    val messageId = ackMessageId(request.body.toString("UTF-8"))
+    if (messageId.isEmpty() || onAnswer == null) {
+      if (currentTurn === turn) currentTurn = null
+      return@withContext Result.success(messageId)
+    }
+    turn.acknowledged(messageId)
+    scope.launch { followAnswer(turn, onAnswer) }
+    Result.success(messageId)
+  }
+
+  /** Reports the answer as it grows; done once it is whole and Muse has been quiet for 3 s. */
+  private suspend fun followAnswer(turn: MuseTurn, onAnswer: (AnswerUpdate) -> Unit) {
+    val started = System.currentTimeMillis()
+    var shownText = ""
+    var shownHeard = ""
+    try {
+      while (currentTurn === turn) {
+        val text = turn.text()
+        val heard = turn.heard
+        val quiet = System.currentTimeMillis() - turn.lastEventAt
+        val elapsed = System.currentTimeMillis() - started
+        if (text != shownText || heard != shownHeard) {
+          shownText = text
+          shownHeard = heard
+          onAnswer(AnswerUpdate(heard, text, done = false))
+        }
+        when {
+          turn.whole() && quiet >= ANSWER_SETTLE_MS -> { onAnswer(AnswerUpdate(heard, text, done = true)); return }
+          text.isEmpty() && elapsed > FIRST_REPLY_MS -> { onAnswer(AnswerUpdate(heard, "", done = true)); return }
+          elapsed > TURN_CAP_MS -> { onAnswer(AnswerUpdate(heard, text, done = true)); return }
+        }
+        delay(250)
+      }
+    } finally {
+      if (currentTurn === turn) currentTurn = null
+    }
+  }
+
+  /** Text message to Muse, used for ring notes; the answer (if wanted) comes via [onAnswer]. */
+  suspend fun sendChat(
+    message: String,
+    sessionId: String = "",
+    onAnswer: ((AnswerUpdate) -> Unit)? = null,
+  ): Result<String> = ask(message, null, sessionId, onAnswer)
 }

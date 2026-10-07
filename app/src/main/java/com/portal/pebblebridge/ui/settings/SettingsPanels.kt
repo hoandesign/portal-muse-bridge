@@ -259,3 +259,79 @@ fun ScreensaverSettingsPanel() {
     }
   }
 }
+
+/** Muse answers, voice, speaking and the commands Muse may run on this Portal. */
+@Composable
+fun MuseSettingsPanel() {
+  val context = LocalContext.current
+  val s by HomePrefs.settings.collectAsState()
+  val ttsStatus by com.portal.pebblebridge.muse.Speaker.status.collectAsState()
+  val timers by com.portal.pebblebridge.home.Timers.timers.collectAsState()
+  var micGranted by remember { mutableStateOf(com.portal.pebblebridge.home.Assistant.hasMicPermission(context)) }
+  LaunchedEffect(Unit) {
+    while (true) { micGranted = com.portal.pebblebridge.home.Assistant.hasMicPermission(context); delay(2_000) }
+  }
+
+  Row(
+    modifier = Modifier.fillMaxSize().padding(16.dp),
+    horizontalArrangement = Arrangement.spacedBy(16.dp),
+  ) {
+    Column(
+      modifier = Modifier.weight(1f).verticalScroll(rememberScrollState()),
+      verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+      SettingsCard("Answers") {
+        ToggleRow("Show Muse's answers", "After a ring note, the robot shows what Muse replied", s.showAnswers) { v ->
+          HomePrefs.update { it.copy(showAnswers = v) }
+        }
+        ToggleRow("Speak answers aloud", "Reads Muse's answers and messages with the Portal's speaker", s.speakAnswers) { v ->
+          HomePrefs.update { it.copy(speakAnswers = v) }
+        }
+        val (ttsText, ttsColor) = when (ttsStatus) {
+          com.portal.pebblebridge.muse.Speaker.Status.READY -> "Voice engine: ready" to Good
+          com.portal.pebblebridge.muse.Speaker.Status.STARTING -> "Voice engine: starting…" to Muted
+          com.portal.pebblebridge.muse.Speaker.Status.NO_ENGINE -> "Voice engine: none installed. Install a text-to-speech app (e.g. RHVoice) on the Portal." to Bad
+        }
+        Text(ttsText, fontSize = 12.sp, color = ttsColor)
+        OutlinedButton(onClick = { com.portal.pebblebridge.muse.Speaker.speak("Beep boop! Hello, I'm your Portal robot.") }) { Text("Test voice") }
+      }
+
+      SettingsCard("Talk to Muse") {
+        ToggleRow("Hold the robot to talk", "Hold, speak, let go: your voice goes to Muse as a voice note", s.holdToTalk) { v ->
+          HomePrefs.update { it.copy(holdToTalk = v) }
+        }
+        Text(
+          if (micGranted) "Microphone: allowed" else "Microphone: not allowed. Restart the app to be asked, or run: adb shell pm grant com.portal.pebblebridge android.permission.RECORD_AUDIO",
+          fontSize = 12.sp,
+          color = if (micGranted) Good else Bad,
+        )
+        Text("The Portal's mic switch must be on. Recordings are stored in your Muse chat.", fontSize = 12.sp, color = Muted)
+      }
+    }
+
+    Column(
+      modifier = Modifier.weight(1f).verticalScroll(rememberScrollState()),
+      verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+      SettingsCard("Muse controls the Portal") {
+        ToggleRow("Let Muse run Portal commands", "Muse uses these when you ask, e.g. \"set a 5 minute timer on my Portal\". Changing this reconnects; allow a few minutes.", s.museCommands) { v ->
+          HomePrefs.update { it.copy(museCommands = v) }
+          // Commands are announced at registration, so reconnect to update Muse.
+          com.portal.pebblebridge.muse.MuseLinkClient.activeInstance?.reconnect()
+        }
+        com.portal.pebblebridge.muse.PortalCommands.all.forEach { c ->
+          Text("• ${c.name.removePrefix("portal.")}: ${c.description.substringBefore(". ").removePrefix("Use when asked to ")}",
+            fontSize = 12.sp, color = if (s.museCommands) Muted else Color(0xFF52525B))
+        }
+      }
+      SettingsCard("Timers & alarms") {
+        if (timers.isEmpty()) Text("None running.", fontSize = 13.sp, color = Muted)
+        val now = System.currentTimeMillis()
+        timers.forEach { t ->
+          Text("${if (t.isAlarm) "Alarm" else "Timer"} ${t.label}: ${com.portal.pebblebridge.home.describeDuration(t.endsAt - now)} left", fontSize = 13.sp, color = Title)
+        }
+        if (timers.isNotEmpty()) OutlinedButton(onClick = { com.portal.pebblebridge.home.Timers.clear() }) { Text("Cancel all") }
+      }
+    }
+  }
+}

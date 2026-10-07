@@ -44,6 +44,11 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.portal.pebblebridge.home.Assistant
+import com.portal.pebblebridge.home.DeviceEvent
+import com.portal.pebblebridge.home.DeviceEvents
+import com.portal.pebblebridge.home.Timers
+import com.portal.pebblebridge.muse.Speaker
 import com.portal.pebblebridge.home.HomePrefs
 import com.portal.pebblebridge.home.HomeSettings
 import com.portal.pebblebridge.home.MonthGrid
@@ -68,11 +73,22 @@ private val ROBOT_LINES = listOf(
   "I LOVE YOUR RING!", "NEW MOVES UNLOCKED!", "BZZT... HELLO!",
 )
 
-/** What the speech bubble is showing: a Pebble note, or the robot's own line after a tap. */
+/** What the speech bubble is showing. */
 private sealed class Bubble {
+  /** A Pebble ring note as it arrived. */
   data class Note(val id: String) : Bubble()
+  /** Muse's answer to that note. */
+  data class Answer(val noteId: String) : Bubble()
+  /** The robot's own line after a tap. */
   data class Robot(val text: String, val shownAt: Long) : Bubble()
+  /** A message from Muse (portal.show_message) or a timer/alarm ringing. */
+  data class Say(val title: String, val text: String, val shownAt: Long) : Bubble()
+  /** A hold-to-talk voice turn, driven by [Assistant.state]. */
+  object Voice : Bubble()
 }
+
+/** What a bubble looks like right now. */
+private data class BubbleView(val key: String, val label: String, val text: String, val footer: String)
 
 /** Weather fetches retry quickly after a failure, then settle to every 20 minutes. */
 private const val WEATHER_REFRESH_MS = 20 * 60_000L
@@ -108,9 +124,15 @@ fun HomeScreen(onOpenSettings: () -> Unit) {
     }
   }
 
-  // Speech bubble: newest Pebble note wins; robot lines fill in after taps.
+  // Speech bubble: a voice turn wins, then the newest event (ring note, its answer, a message
+  // from Muse, a timer). Robot lines fill in after taps.
+  val context = androidx.compose.ui.platform.LocalContext.current
+  val assistant by Assistant.state.collectAsState()
+  val speaking by Speaker.speaking.collectAsState()
+  val timers by Timers.timers.collectAsState()
   var bubble by remember { mutableStateOf<Bubble?>(null) }
   var typingDone by remember { mutableStateOf(false) }
+  var celebrateKey by remember { mutableIntStateOf(0) }
   var lastSeenNoteId by remember { mutableStateOf<String?>(null) }
   val newest = notes.firstOrNull()
   LaunchedEffect(newest?.id) {
@@ -118,19 +140,85 @@ fun HomeScreen(onOpenSettings: () -> Unit) {
     val firstLook = lastSeenNoteId == null
     lastSeenNoteId = newest.id
     val fresh = System.currentTimeMillis() - newest.timestampEpochMs < RECENT_NOTE_MS
-    if (!firstLook || fresh) bubble = Bubble.Note(newest.id)
+    if ((!firstLook || fresh) && bubble != Bubble.Voice) bubble = Bubble.Note(newest.id)
   }
-  val bubbleNote: VoiceNote? = (bubble as? Bubble.Note)?.let { b -> notes.firstOrNull { it.id == b.id } }
-  val bubbleText = when (val b = bubble) {
-    is Bubble.Note -> bubbleNote?.text
-    is Bubble.Robot -> b.text
+  LaunchedEffect(assistant) {
+    if (assistant != Assistant.State.Idle) bubble = Bubble.Voice
+    else if (bubble == Bubble.Voice) bubble = null
+  }
+  LaunchedEffect(Unit) {
+    DeviceEvents.events.collect { e ->
+      when (e) {
+        is DeviceEvent.Say -> bubble = Bubble.Say(e.title, e.text, System.currentTimeMillis())
+        is DeviceEvent.Ring -> {
+          bubble = Bubble.Say(if (e.isAlarm) "ALARM" else "TIMER", "${e.label} IS DONE!", System.currentTimeMillis())
+          celebrateKey++
+        }
+        DeviceEvent.Celebrate -> celebrateKey++
+      }
+    }
+  }
+
+  val noteOf = { id: String -> notes.firstOrNull { it.id == id } }
+  val view: BubbleView? = when (val b = bubble) {
+    is Bubble.Note -> noteOf(b.id)?.let { n ->
+      val footer = when (n.status) {
+        NoteStatus.PENDING -> "SENDING TO MUSE..."
+        NoteStatus.DELIVERED -> if (settings.showAnswers && n.museReply.isNullOrBlank()) "SENT TO MUSE · THINKING..." else "SENT TO MUSE"
+        NoteStatus.FAILED -> "COULDN'T SEND"
+      }
+      BubbleView("note-${n.id}", "YOUR RING", n.text, footer)
+    }
+    is Bubble.Answer -> noteOf(b.noteId)?.museReply?.takeIf { it.isNotBlank() }?.let { r ->
+      BubbleView("answer-${b.noteId}", "MUSE", r, if (noteOf(b.noteId)?.replyDone == true) "" else "...")
+    }
+    is Bubble.Robot -> BubbleView("robot-${b.shownAt}", "BOT", b.text, "")
+    is Bubble.Say -> BubbleView("say-${b.shownAt}", b.title, b.text, "")
+    Bubble.Voice -> when (val a = assistant) {
+      is Assistant.State.Listening -> BubbleView("voice-listen", "LISTENING", "Speak now... let go to send.", "")
+      is Assistant.State.Thinking -> BubbleView("voice-think", "YOU", a.heard.ifEmpty { "..." }, "MUSE IS THINKING...")
+      is Assistant.State.Answer -> BubbleView("voice-answer", "MUSE", a.text, if (a.done) "" else "...")
+      is Assistant.State.Problem -> BubbleView("voice-problem", "OOPS", a.message, "")
+      Assistant.State.Idle -> null
+    }
     null -> null
   }
-  // Auto-dismiss: notes linger for the configured time after typing; robot lines are brief.
-  LaunchedEffect(bubble, typingDone) {
+  val bubbleText = view?.text
+  val answerReady = (bubble as? Bubble.Note)?.let { b -> noteOf(b.id)?.museReply?.isNotBlank() == true } == true
+
+  // A ring note hands over to Muse's answer once it has finished typing.
+  LaunchedEffect(bubble, typingDone, answerReady) {
+    val b = bubble as? Bubble.Note ?: return@LaunchedEffect
+    if (typingDone && answerReady && settings.showAnswers) {
+      delay(1_200L)
+      bubble = Bubble.Answer(b.id)
+    }
+  }
+  // Safety net: no bubble outlives 5 minutes, even if an answer never finishes streaming.
+  LaunchedEffect(bubble) {
     val b = bubble ?: return@LaunchedEffect
-    if (!typingDone) return@LaunchedEffect
-    delay(if (b is Bubble.Note) settings.bubbleSeconds * 1000L else 2_500L)
+    if (b == Bubble.Voice) return@LaunchedEffect
+    delay(5 * 60_000L)
+    if (bubble == b) bubble = null
+  }
+  // Auto-dismiss once everything has been typed out (and finished streaming).
+  val settled = when (val b = bubble) {
+    is Bubble.Answer -> noteOf(b.noteId)?.replyDone == true
+    Bubble.Voice -> (assistant as? Assistant.State.Answer)?.done == true
+    is Bubble.Note -> !(settings.showAnswers && noteOf(b.id)?.status == NoteStatus.DELIVERED && !answerReady)
+    else -> true
+  }
+  LaunchedEffect(bubble, typingDone, settled, speaking) {
+    val b = bubble ?: return@LaunchedEffect
+    if (!typingDone || !settled || speaking) return@LaunchedEffect
+    delay(
+      when (b) {
+        is Bubble.Robot -> 2_500L
+        is Bubble.Note -> if (settings.showAnswers) 90_000L else settings.bubbleSeconds * 1000L
+        else -> settings.bubbleSeconds * 1000L
+      },
+    )
+    if (b == Bubble.Voice) Assistant.dismiss()
     bubble = null
   }
 
@@ -183,10 +271,16 @@ fun HomeScreen(onOpenSettings: () -> Unit) {
             .fillMaxWidth()
             .fillMaxHeight(0.74f),
           dancing = settings.robotDances,
-          talking = bubbleText != null && !typingDone,
+          talking = (bubbleText != null && !typingDone) || speaking,
           onTap = {
-            if (bubble !is Bubble.Note) bubble = Bubble.Robot(ROBOT_LINES.random(), System.currentTimeMillis())
+            if (bubble == null || bubble is Bubble.Robot) bubble = Bubble.Robot(ROBOT_LINES.random(), System.currentTimeMillis())
           },
+          listening = assistant is Assistant.State.Listening,
+          thinking = assistant is Assistant.State.Thinking,
+          celebrateKey = celebrateKey,
+          holdToTalk = settings.holdToTalk,
+          onHoldStart = { Assistant.startListening(context) },
+          onHoldEnd = { Assistant.stopAndSend() },
         )
         androidx.compose.animation.AnimatedVisibility(
           visible = bubbleText != null,
@@ -195,20 +289,20 @@ fun HomeScreen(onOpenSettings: () -> Unit) {
           exit = fadeOut(tween(160)) + scaleOut(tween(160), targetScale = 0.9f),
         ) {
           // Keep showing the last bubble while the exit animation runs.
-          var last by remember { mutableStateOf<Pair<Bubble, String>?>(null) }
-          val current = bubble
-          if (current != null && bubbleText != null) last = current to bubbleText
-          val (shownBubble, shownText) = last ?: return@AnimatedVisibility
+          var last by remember { mutableStateOf<BubbleView?>(null) }
+          if (view != null) last = view
+          val shown = last ?: return@AnimatedVisibility
           DialogBubble(
-            key = when (shownBubble) {
-              is Bubble.Note -> shownBubble.id
-              is Bubble.Robot -> shownBubble.shownAt.toString()
-            },
-            label = if (shownBubble is Bubble.Robot) "BOT" else "YOUR RING",
-            text = shownText,
-            status = bubbleNote?.status,
+            key = shown.key,
+            label = shown.label,
+            text = shown.text,
+            footer = shown.footer,
             onTypingChanged = { typingDone = it },
-            onDismiss = { bubble = null },
+            onDismiss = {
+              if (bubble == Bubble.Voice) Assistant.dismiss()
+              Speaker.stop()
+              bubble = null
+            },
           )
         }
       }
@@ -230,6 +324,10 @@ fun HomeScreen(onOpenSettings: () -> Unit) {
           PixelClock(now, settings)
           Spacer(Modifier.height(20.dp))
           DateWeatherRow(now, weather, weatherFailed)
+          if (timers.isNotEmpty()) {
+            Spacer(Modifier.height(16.dp))
+            TimersRow(timers, now.timeInMillis)
+          }
         }
         MonthCalendar(buildMonthGrid(now, settings.weekStartsMonday))
       }
@@ -465,7 +563,7 @@ private fun DialogBubble(
   key: String,
   label: String,
   text: String,
-  status: NoteStatus?,
+  footer: String,
   onTypingChanged: (Boolean) -> Unit,
   onDismiss: () -> Unit,
 ) {
@@ -507,13 +605,7 @@ private fun DialogBubble(
         )
         Spacer(Modifier.height(8.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
-          val (statusText, statusColor) = when (status) {
-            NoteStatus.PENDING -> "SENDING TO MUSE..." to GB.Dark
-            NoteStatus.DELIVERED -> "SENT TO MUSE" to GB.Darkest
-            NoteStatus.FAILED -> "COULDN'T SEND" to GB.Darkest
-            null -> "" to GB.Dark
-          }
-          Text(statusText, fontFamily = PixelFont, fontSize = 9.sp, color = statusColor)
+          Text(footer, fontFamily = PixelFont, fontSize = 9.sp, color = GB.Dark)
           Spacer(Modifier.weight(1f))
           // ▼ "more" arrow, blinking once typing finishes.
           Canvas(Modifier.size(width = 18.dp, height = 12.dp)) {
@@ -545,3 +637,22 @@ private fun Modifier.combinedClickableNoRipple(onLongClick: (() -> Unit)? = null
     onLongClick = onLongClick,
     onClick = onClick,
   )
+
+/** The next timer or alarm counting down, grouped under the date like the weather. */
+@Composable
+private fun TimersRow(timers: List<com.portal.pebblebridge.home.PortalTimer>, nowMs: Long) {
+  val next = timers.first()
+  val left = ((next.endsAt - nowMs) / 1000).coerceAtLeast(0)
+  val clock = if (left >= 3600) "%d:%02d:%02d".format(left / 3600, left / 60 % 60, left % 60) else "%02d:%02d".format(left / 60, left % 60)
+  Row(verticalAlignment = Alignment.CenterVertically) {
+    Text(if (next.isAlarm) "ALARM" else "TIMER", fontFamily = PixelFont, fontSize = 12.sp, color = GB.Dark)
+    Spacer(Modifier.width(12.dp))
+    Text(next.label, fontFamily = TerminalFont, fontSize = 24.sp, color = GB.Light, maxLines = 1)
+    Spacer(Modifier.width(12.dp))
+    Text(clock, fontFamily = PixelFont, fontSize = 16.sp, color = GB.Lightest)
+    if (timers.size > 1) {
+      Spacer(Modifier.width(12.dp))
+      Text("+${timers.size - 1}", fontFamily = PixelFont, fontSize = 12.sp, color = GB.Dark)
+    }
+  }
+}

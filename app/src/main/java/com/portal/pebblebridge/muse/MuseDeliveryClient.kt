@@ -33,6 +33,12 @@ class MuseDeliveryClient(
         .build()
   }
 
+  /** Muse's answer to a ring note: stored on the note (shown by the robot) and read aloud when done. */
+  private fun answerHandler(noteId: String): (MuseLinkClient.AnswerUpdate) -> Unit = { u ->
+    if (u.text.isNotBlank()) BridgeRepository.updateNoteReply(noteId, u.text, u.done)
+    if (u.done && u.text.isNotBlank()) Speaker.speakIfEnabled(u.text)
+  }
+
   suspend fun deliverNote(
     note: VoiceNote,
     config: BridgeConfig,
@@ -43,9 +49,9 @@ class MuseDeliveryClient(
 
       // 1. If connected via Muse Noise WebSocket session, deliver note as /chat/stream
       if (linkClient != null && linkClient.linkState.value == LinkState.CONNECTED_ONLINE) {
-        val chatResult = linkClient.sendChat(museMessage(note.text), config.museSessionId)
+        val chatResult = linkClient.sendChat(museMessage(note.text), config.museSessionId, answerHandler(note.id))
         if (chatResult.isSuccess) {
-          return@withContext chatResult
+          return@withContext Result.success("")
         }
         Log.w(TAG, "Chat delivery via Noise link failed: ${chatResult.exceptionOrNull()?.message}; trying fallback")
       }
@@ -59,9 +65,9 @@ class MuseDeliveryClient(
           linkClient.linkState.first { it == LinkState.CONNECTED_ONLINE }
         }
         if (linkClient.linkState.value == LinkState.CONNECTED_ONLINE) {
-          val chatResult = linkClient.sendChat(museMessage(note.text), config.museSessionId)
+          val chatResult = linkClient.sendChat(museMessage(note.text), config.museSessionId, answerHandler(note.id))
           if (chatResult.isSuccess) {
-            return@withContext chatResult
+            return@withContext Result.success("")
           }
         }
       }

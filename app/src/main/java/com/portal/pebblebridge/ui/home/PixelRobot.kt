@@ -13,6 +13,7 @@ import androidx.compose.runtime.withFrameMillis
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
+import kotlinx.coroutines.launch
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.floor
@@ -38,6 +39,7 @@ private const val EXCITED_MS = 1600L
 /** Art-space size: robot plus room for arms, jump, hearts and notes. */
 private const val STAGE_W = 48f
 private const val STAGE_H = 58f
+private const val HOLD_MS = 350L
 
 /**
  * An 8-bit robot that dances, blinks and smiles. Tapping makes it jump with hearts and switch
@@ -49,10 +51,27 @@ fun PixelRobot(
   dancing: Boolean,
   talking: Boolean,
   onTap: () -> Unit,
+  /** Recording the user's voice: ear cupped, eyes wide, sound waves. */
+  listening: Boolean = false,
+  /** Waiting for Muse: eyes up, slow bob. */
+  thinking: Boolean = false,
+  /** Bump to make the robot jump and cheer (e.g. Muse's portal.celebrate). */
+  celebrateKey: Int = 0,
+  /** When on, holding the robot calls [onHoldStart] and releasing it [onHoldEnd]. */
+  holdToTalk: Boolean = false,
+  onHoldStart: () -> Unit = {},
+  onHoldEnd: () -> Unit = {},
 ) {
   var now by remember { mutableLongStateOf(0L) }
   var tappedAt by remember { mutableLongStateOf(-100_000L) }
   var routine by remember { mutableStateOf(0) }
+
+  LaunchedEffect(celebrateKey) {
+    if (celebrateKey > 0) {
+      tappedAt = now
+      routine = (routine + 1) % ROUTINES.size
+    }
+  }
 
   LaunchedEffect(Unit) {
     val start = withFrameMillis { it }
@@ -62,12 +81,33 @@ fun PixelRobot(
   }
 
   Canvas(
-    modifier = modifier.pointerInput(Unit) {
-      detectTapGestures(onTap = {
-        tappedAt = now
-        routine = (routine + 1) % ROUTINES.size
-        onTap()
-      })
+    modifier = modifier.pointerInput(holdToTalk) {
+      var held = false
+      detectTapGestures(
+        onPress = {
+          held = false
+          if (holdToTalk) {
+            // A short tap is a tap; holding for HOLD_MS starts talking until release.
+            kotlinx.coroutines.coroutineScope {
+              val job = this.launch {
+                kotlinx.coroutines.delay(HOLD_MS)
+                held = true
+                onHoldStart()
+              }
+              tryAwaitRelease()
+              job.cancel()
+            }
+            if (held) onHoldEnd()
+          }
+        },
+        onTap = {
+          if (!held) {
+            tappedAt = now
+            routine = (routine + 1) % ROUTINES.size
+            onTap()
+          }
+        },
+      )
     },
   ) {
     val unit = floor(min(size.width / STAGE_W, size.height / STAGE_H)).coerceAtLeast(1f)
@@ -81,7 +121,7 @@ fun PixelRobot(
 
     // Motion. While talking it sways gently and waves instead of dancing.
     val phase = now / BEAT_MS
-    val dance = dancing && !talking
+    val dance = dancing && !talking && !listening && !thinking
     val bounce = if (dance) abs(sin(PI * phase)).toFloat() * 2.5f else (sin(PI * now / 900.0).toFloat() + 1f) * 0.4f
     val sway = if (dance) sin(PI * phase / 2).toFloat() * 2f else 0f
     val headLag = if (dance) sin(PI * (phase - 0.3f) / 2).toFloat() * 0.8f else 0f
@@ -92,6 +132,8 @@ fun PixelRobot(
     val step = floor(phase).toInt()
 
     val (leftArm, rightArm) = when {
+      listening -> Arm.UP to Arm.DOWN
+      thinking -> Arm.DOWN to Arm.OUT
       talking -> Arm.DOWN to (if ((now / 300) % 2 == 0L) Arm.UP else Arm.OUT)
       excited -> Arm.UP to Arm.UP
       dance -> ROUTINES[routine][step % ROUTINES[routine].size]
@@ -133,7 +175,17 @@ fun PixelRobot(
 
       // Head (lags slightly behind the body for a looser dance).
       val hx = rx + headLag
-      drawHead(hx, top, blinking, excited, talking, now)
+      drawHead(hx, top, blinking, excited, talking, now, mood = if (listening) 1 else if (thinking) 2 else 0)
+      if (listening) {
+        // Sound waves arriving at the cupped ear.
+        val w = ((now / 200) % 3).toInt()
+        for (i in 0..w) art(hx - 4f - i * 3f, top + 9f + i, List(4 - i) { "X" }, if (i == w) GB.Dark else GB.Darkest)
+      }
+      if (thinking) {
+        // "..." dots popping in turn above the head.
+        val n = ((now / 400) % 4).toInt()
+        for (i in 0 until n) rect(hx + 26f + i * 3f, top + 2f - i, 2f, 2f, GB.Darkest)
+      }
 
       // Antenna with a blinking tip.
       rect(hx + 14f, top + 3f, 2f, 3f, GB.Darkest)
@@ -190,7 +242,7 @@ private fun PixelPen.drawArm(rx: Float, top: Float, pose: Arm, mirrored: Boolean
   }
 }
 
-private fun PixelPen.drawHead(hx: Float, top: Float, blinking: Boolean, excited: Boolean, talking: Boolean, now: Long) {
+private fun PixelPen.drawHead(hx: Float, top: Float, blinking: Boolean, excited: Boolean, talking: Boolean, now: Long, mood: Int = 0) {
   val y = top + 6f
   // Ears.
   box(hx + 2f, y + 5f, 3f, 6f, GB.Dark)
@@ -205,6 +257,16 @@ private fun PixelPen.drawHead(hx: Float, top: Float, blinking: Boolean, excited:
 
   val eyeY = y + 5f
   when {
+    mood == 1 -> {
+      // Wide, attentive eyes.
+      rect(hx + 10f, eyeY - 1f, 2f, 4f, GB.Lightest)
+      rect(hx + 18f, eyeY - 1f, 2f, 4f, GB.Lightest)
+    }
+    mood == 2 -> {
+      // Looking up and to the side, thinking.
+      rect(hx + 11f, eyeY - 1f, 2f, 2f, GB.Lightest)
+      rect(hx + 19f, eyeY - 1f, 2f, 2f, GB.Lightest)
+    }
     excited -> {
       // Happy ^ ^ eyes.
       art(hx + 9f, eyeY, listOf(".XX.", "X..X"), GB.Lightest)
@@ -225,6 +287,8 @@ private fun PixelPen.drawHead(hx: Float, top: Float, blinking: Boolean, excited:
 
   val mouthY = y + 9f
   when {
+    mood == 1 -> box(hx + 14f, mouthY, 3f, 3f, GB.Darkest, GB.Lightest) // "o"
+    mood == 2 -> rect(hx + 14f, mouthY + 1f, 4f, 1f, GB.Lightest) // "hmm"
     talking && (now / 140) % 2 == 0L -> box(hx + 13f, mouthY, 5f, 3f, GB.Light, GB.Lightest)
     excited -> {
       rect(hx + 12f, mouthY, 7f, 1f, GB.Lightest)

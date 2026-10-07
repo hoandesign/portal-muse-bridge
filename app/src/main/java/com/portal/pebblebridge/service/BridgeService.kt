@@ -95,6 +95,18 @@ class BridgeService : Service() {
     // The Portal launcher resets the screensaver on boot; keep ours registered if enabled.
     com.portal.pebblebridge.home.HomePrefs.init(this)
     com.portal.pebblebridge.home.ScreensaverGuard.watch(this)
+    com.portal.pebblebridge.muse.Speaker.init(this)
+    com.portal.pebblebridge.muse.PortalCommands.init(this)
+    // Timers and alarms set by Muse ring here, whatever screen is showing.
+    serviceScope.launch {
+      while (true) {
+        for (t in com.portal.pebblebridge.home.Timers.takeDue()) {
+          com.portal.pebblebridge.home.DeviceEvents.emit(com.portal.pebblebridge.home.DeviceEvent.Ring(t.label, t.isAlarm))
+          ringTone()
+        }
+        kotlinx.coroutines.delay(1_000L)
+      }
+    }
     serviceScope.launch {
       while (true) {
         com.portal.pebblebridge.home.ScreensaverGuard.apply(this@BridgeService)
@@ -227,5 +239,19 @@ class BridgeService : Service() {
       if (candidates.isNotEmpty()) return candidates.first()
     } catch (_: Exception) {}
     return "127.0.0.1"
+  }
+
+  /** Three short beeps, repeated three times. */
+  private fun ringTone() {
+    serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+      val tone = try {
+        android.media.ToneGenerator(android.media.AudioManager.STREAM_ALARM, 90)
+      } catch (e: Exception) { return@launch }
+      repeat(3) {
+        tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP2, 600)
+        kotlinx.coroutines.delay(1_200L)
+      }
+      tone.release()
+    }
   }
 }

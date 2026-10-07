@@ -27,6 +27,14 @@ data class HomeSettings(
   val keepAwake: Boolean = true,
   /** Index into the pixel color themes. */
   val themeIndex: Int = 0,
+  /** Show Muse's answer to a ring note or voice question in the robot's bubble. */
+  val showAnswers: Boolean = true,
+  /** Read Muse's answers and messages aloud. */
+  val speakAnswers: Boolean = true,
+  /** Hold the robot to ask Muse by voice. */
+  val holdToTalk: Boolean = true,
+  /** Let Muse run Portal commands (messages, timers, volume, theme). */
+  val museCommands: Boolean = true,
 )
 
 object HomePrefs {
@@ -43,6 +51,10 @@ object HomePrefs {
   private const val K_SCREENSAVER = "screensaver_enabled"
   private const val K_AWAKE = "keep_awake"
   private const val K_THEME = "theme_index"
+  private const val K_SHOW_ANSWERS = "show_answers"
+  private const val K_SPEAK = "speak_answers"
+  private const val K_TALK = "hold_to_talk"
+  private const val K_COMMANDS = "muse_commands"
 
   val BUBBLE_CHOICES = listOf(15, 30, 60, 120, 300)
 
@@ -68,6 +80,10 @@ object HomePrefs {
       screensaverEnabled = p.getBoolean(K_SCREENSAVER, d.screensaverEnabled),
       keepAwake = p.getBoolean(K_AWAKE, d.keepAwake),
       themeIndex = p.getInt(K_THEME, d.themeIndex),
+      showAnswers = p.getBoolean(K_SHOW_ANSWERS, d.showAnswers),
+      speakAnswers = p.getBoolean(K_SPEAK, d.speakAnswers),
+      holdToTalk = p.getBoolean(K_TALK, d.holdToTalk),
+      museCommands = p.getBoolean(K_COMMANDS, d.museCommands),
     )
   }
 
@@ -87,6 +103,10 @@ object HomePrefs {
       putBoolean(K_SCREENSAVER, s.screensaverEnabled)
       putBoolean(K_AWAKE, s.keepAwake)
       putInt(K_THEME, s.themeIndex)
+      putBoolean(K_SHOW_ANSWERS, s.showAnswers)
+      putBoolean(K_SPEAK, s.speakAnswers)
+      putBoolean(K_TALK, s.holdToTalk)
+      putBoolean(K_COMMANDS, s.museCommands)
       apply()
     }
   }

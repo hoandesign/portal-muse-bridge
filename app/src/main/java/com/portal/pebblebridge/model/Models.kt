@@ -23,7 +23,9 @@ data class VoiceNote(
   val title: String? = null,
   val source: String = "Pebble Index Ring",
   val status: NoteStatus = NoteStatus.PENDING,
+  /** Muse's answer, filled in from /chat/subscribe after delivery. */
   val museReply: String? = null,
+  val replyDone: Boolean = false,
   val error: String? = null,
 )
 
