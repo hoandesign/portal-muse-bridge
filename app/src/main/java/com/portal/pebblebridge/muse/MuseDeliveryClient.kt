@@ -207,8 +207,8 @@ class MuseDeliveryClient(
 
 /** Appended to every note sent to Muse (not shown on the Portal), so Muse reads past STT errors. */
 const val TRANSCRIPTION_HINT =
-  "(Voice note from my Pebble ring, transcribed by speech-to-text. Some words may be misheard, " +
-    "so please work out what I most likely meant.)"
+  "(Transcribed from speech, so some words may be misheard. " +
+    "Please go by what I most likely meant.)"
 
 /** The text Muse receives for a ring note: the transcription followed by [TRANSCRIPTION_HINT]. */
 fun museMessage(transcription: String): String = "${transcription.trim()}\n\n$TRANSCRIPTION_HINT"

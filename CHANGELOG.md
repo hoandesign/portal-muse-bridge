@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The note added to transcriptions is now general (not tied to the Pebble ring): *(Transcribed from speech, so some words may be misheard. Please go by what I most likely meant.)*
 - **Muse's answers:** ring notes now show Muse's reply in the robot's bubble. Muse's answers are read from `/chat/subscribe`, matched to our message like hey-muse does.
 - **Talk to Muse:** hold the robot to record a voice note; the robot shows what Muse heard and its answer.
 - **Spoken answers:** answers and messages are read aloud with Android text-to-speech, in Vietnamese when the text is Vietnamese.
