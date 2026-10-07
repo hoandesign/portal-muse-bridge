@@ -144,7 +144,8 @@ object PortalCommands {
       spec.put(c.name, JSONObject()
         .put("description", c.description)
         .put("required", params(c.required))
-        .put("optional", params(c.optional)))
+        .put("optional", params(c.optional))
+        .put("timeout_ms", 30_000))
     }
     return spec
   }

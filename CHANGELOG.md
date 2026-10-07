@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Muse now uses the Portal's commands.** The Portal registers with the identity Meta's SDK uses (`linux` platform and model) and the display name **Portal**, so "my Portal" maps to it. Verified: Muse set an alarm and a timer on the Portal.
+- **Timers and alarms survive restarts** (saved to `files/timers.json`).
+- **A ringing timer interrupts** whatever is playing instead of waiting in the queue.
+- **Cleaner bubbles:** Markdown marks are removed, and answers longer than 8 pages end with "the rest is in History".
 - **History:** every ring note, voice question, answer, message and timer is saved (last 200, across restarts). Tap an entry to replay it.
 - **Auto play:** answers, messages and timers are shown and spoken one after another, with long answers split into pages. Tap the bubble to skip; switch auto play off in Settings → Muse.
 - **Several questions at once:** the app now follows several open questions. When Muse answers queued notes in one reply (seen on a real Muse), the earlier ones are marked "answered with the next one" instead of waiting forever.

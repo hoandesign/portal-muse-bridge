@@ -153,6 +153,8 @@ Ideas and protocol details here come from [hey-muse](https://github.com/wobsoria
 | `portal.set_theme` | Switches the color theme |
 | `portal.celebrate` | Makes the robot jump and cheer |
 
+The Portal shows up in Muse as **Portal**. Say "on my Portal" so Muse uses these rather than your phones' own alarm and reminder commands. Timers and alarms are saved, so they survive restarts.
+
 Nothing here runs shell commands, reads files or reaches other devices. Turn any of this off in **Settings → Muse**. Changing the command switch reconnects to Muse, which takes a few minutes.
 
 ## Endpoints

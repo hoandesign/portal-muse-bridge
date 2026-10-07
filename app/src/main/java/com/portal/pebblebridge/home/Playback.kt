@@ -79,7 +79,7 @@ object Playback {
   }
 
   private suspend fun play(entry: HistoryEntry) {
-    val pages = paginate(entry.answer)
+    val pages = capPages(paginate(forDisplay(entry.answer)))
     if (pages.isEmpty()) return
     if (HomePrefs.settings.value.speakAnswers) Speaker.speak(entry.answer)
     for ((i, page) in pages.withIndex()) {
@@ -90,6 +90,19 @@ object Playback {
     withTimeoutOrNull(5 * 60_000L) { Speaker.speaking.first { !it } }
     delay(if (queue.value.isNotEmpty()) BETWEEN_ITEMS_MS else HomePrefs.settings.value.bubbleSeconds * 1000L)
   }
+
+  /** Long answers show their first pages; the whole text is in History. */
+  const val MAX_PAGES = 8
+
+  fun capPages(pages: List<String>): List<String> =
+    if (pages.size <= MAX_PAGES) pages else pages.take(MAX_PAGES - 1) + "...THE REST IS IN HISTORY."
+
+  /** Markdown marks read as noise in a pixel dialog box: drop them, keep the words. */
+  fun forDisplay(text: String): String = text
+    .replace(Regex("""\[([^\]]+)]\([^)]*\)"""), "$1")
+    .replace(Regex("""(?m)^\s*#+\s*"""), "")
+    .replace(Regex("""(?m)^\s*[-*]\s+"""), "• ")
+    .replace(Regex("""[*_`]+"""), "")
 
   /** Splits text into bubble pages at word boundaries (paragraph breaks start a new page). */
   fun paginate(text: String, max: Int = PAGE_CHARS): List<String> {

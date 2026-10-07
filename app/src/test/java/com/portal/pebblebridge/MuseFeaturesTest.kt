@@ -202,4 +202,17 @@ class MuseFeaturesTest {
     assertFalse(Speaker.shouldSpeak(isVietnamese = true, hasVietnameseVoice = false))
     assertTrue(Speaker.shouldSpeak(isVietnamese = true, hasVietnameseVoice = true))
   }
+
+  @Test fun `timers and alarms survive a restart`() {
+    val list = listOf(com.portal.pebblebridge.home.PortalTimer("a", "WAKE", 1_000, isAlarm = true))
+    assertEquals(list, Timers.decode(Timers.encode(list)))
+  }
+
+  @Test fun `markdown is cleaned for the dialog box and long answers are capped`() {
+    assertEquals("Use alarm.set and bold here", Playback.forDisplay("Use `alarm.set` and **bold** here"))
+    assertEquals("Title\n• one", Playback.forDisplay("## Title\n- one"))
+    val pages = Playback.capPages(List(20) { "p$it" })
+    assertEquals(Playback.MAX_PAGES, pages.size)
+    assertTrue(pages.last().contains("HISTORY"))
+  }
 }

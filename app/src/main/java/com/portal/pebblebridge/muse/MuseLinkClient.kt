@@ -347,7 +347,8 @@ class MuseLinkClient(
     }
 
     val currentNodeId = BridgeRepository.nodeId.ifBlank { "homelink-e1890c" }
-    val currentDisplayName = BridgeRepository.bleDeviceName.value.ifBlank { "MuseGadget" }
+    // "Portal", so Muse connects "my Portal" with this gadget (it otherwise guesses Meta Portal's own assistant).
+    val currentDisplayName = "Portal"
 
     // Send link.register message
     val registerId = UUID.randomUUID().toString()
@@ -358,10 +359,12 @@ class MuseLinkClient(
       put("params", JSONObject().apply {
         put("node_id", currentNodeId)
         put("display_name", currentDisplayName)
-        put("platform", "android")
+        // The values Meta's Linux SDK sends; the Muse VM knows these (as hey-muse notes). Unknown
+        // ones were accepted but Muse's model was not offered our commands.
+        put("platform", "linux")
         put("version", "1.0.0")
         put("device_family", "homehub")
-        put("model_id", "portal")
+        put("model_id", "linux")
         put("is_wakeup_supported", false)
         put("commands_v2", PortalCommands.registerSpec())
       })
@@ -469,7 +472,7 @@ class MuseLinkClient(
       m.optString("id") == registerId && method.isEmpty() -> {
         val err = m.opt("error")
         if (err != null && err != JSONObject.NULL && err != false) Log.e(TAG, "link.register rejected: $err")
-        else Log.i(TAG, "Registered with Muse")
+        else Log.i(TAG, "Registered with Muse (reply keys: ${m.keys().asSequence().toList()}, result: ${m.optJSONObject("result")?.keys()?.asSequence()?.toList()})")
       }
       m.optString("event") in setOf("link.unpaired", "node.unpaired") ->
         Log.w(TAG, "Muse removed this device (${m.optString("event")})")

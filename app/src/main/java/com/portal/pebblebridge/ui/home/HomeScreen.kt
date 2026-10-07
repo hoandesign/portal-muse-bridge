@@ -620,8 +620,10 @@ private fun TimersRow(timers: List<com.portal.pebblebridge.home.PortalTimer>, no
   Row(verticalAlignment = Alignment.CenterVertically) {
     Text(if (next.isAlarm) "ALARM" else "TIMER", fontFamily = PixelFont, fontSize = 12.sp, color = GB.Dark)
     Spacer(Modifier.width(12.dp))
-    Text(next.label, fontFamily = TerminalFont, fontSize = 24.sp, color = GB.Light, maxLines = 1)
-    Spacer(Modifier.width(12.dp))
+    if (next.label != "ALARM" && next.label != "TIMER") {
+      Text(next.label, fontFamily = TerminalFont, fontSize = 24.sp, color = GB.Light, maxLines = 1)
+      Spacer(Modifier.width(12.dp))
+    }
     Text(clock, fontFamily = PixelFont, fontSize = 16.sp, color = GB.Lightest)
     if (timers.size > 1) {
       Spacer(Modifier.width(12.dp))

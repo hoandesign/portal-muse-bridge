@@ -30,16 +30,41 @@ data class PortalTimer(val id: String, val label: String, val endsAt: Long, val 
 object Timers {
   private val _timers = MutableStateFlow<List<PortalTimer>>(emptyList())
   val timers: StateFlow<List<PortalTimer>> = _timers.asStateFlow()
+  private var file: java.io.File? = null
+
+  /** Loads saved timers/alarms (they survive app restarts) and saves every change. */
+  fun init(context: android.content.Context) {
+    if (file != null) return
+    val f = java.io.File(context.applicationContext.filesDir, "timers.json")
+    file = f
+    _timers.value = runCatching { if (f.exists()) decode(f.readText()) else emptyList() }.getOrDefault(emptyList())
+  }
+
+  private fun save() { file?.let { f -> runCatching { f.writeText(encode(_timers.value)) } } }
+
+  fun encode(list: List<PortalTimer>): String = org.json.JSONArray().apply {
+    list.forEach { put(org.json.JSONObject().put("id", it.id).put("label", it.label).put("endsAt", it.endsAt).put("isAlarm", it.isAlarm)) }
+  }.toString()
+
+  fun decode(text: String): List<PortalTimer> {
+    val a = org.json.JSONArray(text)
+    return (0 until a.length()).map { i ->
+      val o = a.getJSONObject(i)
+      PortalTimer(o.getString("id"), o.getString("label"), o.getLong("endsAt"), o.getBoolean("isAlarm"))
+    }.sortedBy { it.endsAt }
+  }
 
   fun startTimer(seconds: Long, label: String, now: Long = System.currentTimeMillis()): PortalTimer {
     val t = PortalTimer(UUID.randomUUID().toString(), label.ifBlank { "TIMER" }, now + seconds * 1000, isAlarm = false)
     _timers.update { (it + t).sortedBy { x -> x.endsAt } }
+    save()
     return t
   }
 
   fun setAlarm(hour: Int, minute: Int, label: String, now: Calendar = Calendar.getInstance()): PortalTimer {
     val t = PortalTimer(UUID.randomUUID().toString(), label.ifBlank { "ALARM" }, nextOccurrence(hour, minute, now), isAlarm = true)
     _timers.update { (it + t).sortedBy { x -> x.endsAt } }
+    save()
     return t
   }
 
@@ -53,6 +78,7 @@ object Timers {
         match
       }
     }
+    if (removed > 0) save()
     return removed
   }
 
@@ -60,10 +86,11 @@ object Timers {
   fun takeDue(now: Long = System.currentTimeMillis()): List<PortalTimer> {
     var due = emptyList<PortalTimer>()
     _timers.update { list -> due = list.filter { it.endsAt <= now }; list - due.toSet() }
+    if (due.isNotEmpty()) save()
     return due
   }
 
-  fun clear() { _timers.value = emptyList() }
+  fun clear() { _timers.value = emptyList(); save() }
 
   /** The next time the clock reads hour:minute, today or tomorrow. */
   fun nextOccurrence(hour: Int, minute: Int, now: Calendar): Long {
