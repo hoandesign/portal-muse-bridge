@@ -288,7 +288,9 @@ fun MuseSettingsPanel() {
           HomePrefs.update { it.copy(speakAnswers = v) }
         }
         val (ttsText, ttsColor) = when (ttsStatus) {
-          com.portal.pebblebridge.muse.Speaker.Status.READY -> "Voice engine: ready" to Good
+          com.portal.pebblebridge.muse.Speaker.Status.READY ->
+            (if (com.portal.pebblebridge.muse.Speaker.vietnameseVoice) "Voice engine: ready (Vietnamese too)"
+            else "Voice engine: ready. No Vietnamese voice, so Vietnamese answers are shown but not read aloud.") to Good
           com.portal.pebblebridge.muse.Speaker.Status.STARTING -> "Voice engine: starting…" to Muted
           com.portal.pebblebridge.muse.Speaker.Status.NO_ENGINE -> "Voice engine: none installed. Install a text-to-speech app (e.g. RHVoice) on the Portal." to Bad
         }

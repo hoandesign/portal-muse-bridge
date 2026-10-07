@@ -140,4 +140,10 @@ class MuseFeaturesTest {
     assertFalse(Speaker.looksVietnamese("buy milk"))
     assertEquals(2, Speaker.chunks("a".repeat(30) + ". " + "b".repeat(30), 40).size)
   }
+
+  @Test fun `Vietnamese is only read aloud with a Vietnamese voice`() {
+    assertTrue(Speaker.shouldSpeak(isVietnamese = false, hasVietnameseVoice = false))
+    assertFalse(Speaker.shouldSpeak(isVietnamese = true, hasVietnameseVoice = false))
+    assertTrue(Speaker.shouldSpeak(isVietnamese = true, hasVietnameseVoice = true))
+  }
 }

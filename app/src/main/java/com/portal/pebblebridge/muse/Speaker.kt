@@ -28,6 +28,14 @@ object Speaker {
   val speaking: StateFlow<Boolean> = _speaking.asStateFlow()
 
   @Volatile private var tts: TextToSpeech? = null
+  private val VIETNAMESE_LOCALE = Locale("vi", "VN")
+
+  /** Whether the engine has a Vietnamese voice (the Portal's built-in one doesn't). */
+  @Volatile var vietnameseVoice = false
+    private set
+
+  /** Vietnamese text is only read when there's a Vietnamese voice for it. */
+  fun shouldSpeak(isVietnamese: Boolean, hasVietnameseVoice: Boolean) = !isVietnamese || hasVietnameseVoice
 
   fun init(context: Context) {
     if (tts != null) return
@@ -50,6 +58,7 @@ object Speaker {
         @Deprecated("Deprecated in Java")
         override fun onError(id: String?) { _speaking.value = false }
       })
+      vietnameseVoice = engine.isLanguageAvailable(VIETNAMESE_LOCALE) >= TextToSpeech.LANG_AVAILABLE
       _status.value = Status.READY
       Log.i(TAG, "text-to-speech ready: ${engine.defaultEngine}")
     }
@@ -64,9 +73,13 @@ object Speaker {
     if (_status.value != Status.READY) return
     val clean = forSpeech(text)
     if (clean.isBlank()) return
-    val wanted = if (looksVietnamese(clean)) Locale("vi", "VN") else Locale.getDefault()
-    val supported = engine.isLanguageAvailable(wanted) >= TextToSpeech.LANG_AVAILABLE
-    engine.language = if (supported) wanted else Locale.getDefault()
+    val vietnamese = looksVietnamese(clean)
+    if (!shouldSpeak(vietnamese, vietnameseVoice)) {
+      // An English voice would mangle Vietnamese; the answer stays on screen only.
+      Log.i(TAG, "no Vietnamese voice; showing the answer without reading it")
+      return
+    }
+    engine.language = if (vietnamese) VIETNAMESE_LOCALE else Locale.getDefault()
     // Engines cap one utterance (often ~4000 chars); speak in sentence-sized pieces.
     chunks(clean, 3_500).forEachIndexed { i, part ->
       engine.speak(part, if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, UUID.randomUUID().toString())

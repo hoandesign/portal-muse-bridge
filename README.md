@@ -139,7 +139,7 @@ Ideas and protocol details here come from [hey-muse](https://github.com/wobsoria
 
 - **Answers on screen.** After a ring note, the robot's bubble shows what Muse replied ("MUSE: …"). The app reads answers from Muse's `/chat/subscribe` stream; `/chat/stream` only acknowledges a message.
 - **Talk to Muse.** Hold the robot, speak, and let go. The Portal records 16 kHz WAV and sends it to Muse as a voice note, which Muse transcribes. The robot shows what Muse heard, then the answer. Grant the microphone once: `adb shell pm grant com.portal.pebblebridge android.permission.RECORD_AUDIO`.
-- **Spoken answers.** Answers and messages are read aloud with Android text-to-speech, in Vietnamese when the text is Vietnamese and the voice engine supports it. The Portal needs a text-to-speech app installed; **Settings → Muse** shows whether one is ready.
+- **Spoken answers.** Answers and messages are read aloud with Android text-to-speech, using the Portal's built-in voice (English, French, German, Italian, Spanish). It has no Vietnamese voice, so Vietnamese answers are shown on screen but not read aloud. **Settings → Muse** shows the voice engine's status.
 - **Muse controls the Portal.** The Portal tells Muse which commands it offers, and Muse calls them when you ask (for example "set a 10 minute tea timer on my Portal"):
 
 | Command | What it does |
