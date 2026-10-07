@@ -19,7 +19,7 @@ The reference is [facebookincubator/muse-gadget-sdk](https://github.com/facebook
 
 - Connect the Noise link to `wss://<noise_host>/v1/noise?vm_id=…`, where `noise_host` comes from `provision_v2` (default `hatch.metaaivm.com`). **Never use `vm_ws_url`**: its per-VM hostname doesn't resolve.
 - A 403 on the `/v1/noise` upgrade is normal for a few minutes after pairing or any app restart. It's not a code bug. If it never clears, the fix is a new SDK token and re-pairing.
-- Muse's answers come on `/chat/subscribe` (NDJSON events), not on the `/chat/stream` response (only an ack with `message_id`). `MuseTurn` matches answers to our message (port of hey-muse `turn.go`). Register the turn **before** sending; events can beat the ack.
+- Muse's answers come on `/chat/subscribe` (NDJSON events), not on the `/chat/stream` response (only an ack with `message_id`). `MuseTurn` matches answers to our message (port of hey-muse `turn.go`). Register the turn **before** sending; events can beat the ack. Subscribe with `{"session_id": …}` when notes go to a side chat: the default feed only has the main chat's messages (a side chat sends just `sessions.updated`).
 - Commands: announce them in `link.register` → `commands_v2` (SDK executor shape). They arrive as `link.invoke` on `/link-control` (length-prefixed) **or** `client.invoke` on `/chat/subscribe` (for turns this device started); answer both with `link.result`.
 - All encrypt-and-send goes through `sendLock`: the Noise nonce order must match the send order.
 - Never log decrypted BLE payloads: `provision_v2` carries access and refresh tokens.

@@ -399,7 +399,10 @@ class MuseLinkClient(
       subscribeLines = LineBuffer()
       subscribeOpen = true
       frames.forEach { ws.send(it.toByteString()) }
-      transport.encryptBodyChunk(sid, "{}".toByteArray(), endBody = true).forEach { ws.send(it.toByteString()) }
+      // Follow the side chat ring notes go to, if one is set; answers there aren't on the main feed.
+      val session = BridgeRepository.config.value.museSessionId
+      val body = if (session.isBlank()) "{}" else JSONObject().put("session_id", session).toString()
+      transport.encryptBodyChunk(sid, body.toByteArray(), endBody = true).forEach { ws.send(it.toByteString()) }
     }
     Log.i(TAG, "Opened /chat/subscribe on stream $subscribeStreamId")
   }
@@ -436,7 +439,11 @@ class MuseLinkClient(
         }
         try {
           subscribeLines.feed(data).forEach { line ->
-            val e = ChatEvent.parse(line) ?: return@forEach
+            val e = ChatEvent.parse(line)
+            if (e == null) {
+              return@forEach
+            }
+            Log.v(TAG, "event ${e.event}")
             if (e.event == "client.invoke") clientInvoke(e) else currentTurn?.add(e)
           }
         } catch (e: Exception) {
