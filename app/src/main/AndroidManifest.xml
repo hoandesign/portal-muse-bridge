@@ -23,6 +23,11 @@
     <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
 
+    <queries>
+        <package android:name="com.portal.portalani" />
+        <provider android:authorities="com.portal.portalani.bridge" />
+    </queries>
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"

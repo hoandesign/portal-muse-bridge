@@ -2,6 +2,7 @@ package com.portal.pebblebridge
 
 import com.portal.pebblebridge.model.BridgeConfig
 import com.portal.pebblebridge.model.NoteStatus
+import com.portal.pebblebridge.muse.PortalAniClient
 import com.portal.pebblebridge.server.McpHttpServer
 import com.portal.pebblebridge.state.BridgeRepository
 import java.io.OutputStreamWriter
@@ -38,6 +39,7 @@ class McpHttpServerTest {
 
   @After
   fun tearDown() {
+    PortalAniClient.testHandler = null
     server.stop()
     testScope.cancel()
   }
@@ -107,8 +109,61 @@ class McpHttpServerTest {
     assertEquals(200, res.statusCode)
     val json = JSONObject(res.body)
     val tools = json.getJSONObject("result").getJSONArray("tools")
-    assertEquals(1, tools.length())
+    assertEquals(9, tools.length())
     assertEquals("send_muse_note", tools.getJSONObject(0).getString("name"))
+    assertEquals("anilist_status", tools.getJSONObject(1).getString("name"))
+  }
+
+  @Test
+  fun testAniListHttpAndMcpBridge() {
+    PortalAniClient.testHandler = { action, params ->
+      when (action) {
+        "lists", "anilist_get_lists" -> JSONObject()
+          .put("ok", true)
+          .put("status", params.optString("status", "CURRENT"))
+          .put("count", 1)
+        "graphql" -> JSONObject()
+          .put("data", JSONObject().put("Viewer", JSONObject().put("name", "Hoan")))
+        else -> JSONObject().put("ok", true).put("action", action)
+      }
+    }
+
+    // 1. REST GET /anilist/lists
+    val conn = (URL("http://127.0.0.1:$testPort/anilist/lists?status=WATCHING").openConnection() as HttpURLConnection).apply {
+      requestMethod = "GET"
+      connectTimeout = 3000
+      readTimeout = 3000
+    }
+    assertEquals(200, conn.responseCode)
+    val listBody = JSONObject(conn.inputStream.bufferedReader().readText())
+    assertTrue(listBody.getBoolean("ok"))
+    assertEquals("WATCHING", listBody.getString("status"))
+
+    // 2. GraphQL proxy POST /anilist/graphql
+    val gqlRes = postJson(
+      "http://127.0.0.1:$testPort/anilist/graphql",
+      JSONObject().put("query", "query { Viewer { name } }").toString()
+    )
+    assertEquals(200, gqlRes.statusCode)
+    assertEquals("Hoan", JSONObject(gqlRes.body).getJSONObject("data").getJSONObject("Viewer").getString("name"))
+
+    // 3. MCP tool call anilist_get_lists
+    val mcpReq = JSONObject()
+      .put("jsonrpc", "2.0")
+      .put("id", 77)
+      .put("method", "tools/call")
+      .put(
+        "params",
+        JSONObject()
+          .put("name", "anilist_get_lists")
+          .put("arguments", JSONObject().put("status", "PLANNING"))
+      )
+    val mcpRes = postJson("http://127.0.0.1:$testPort/api/mcp", mcpReq.toString())
+    assertEquals(200, mcpRes.statusCode)
+    val mcpJson = JSONObject(mcpRes.body).getJSONObject("result")
+    assertFalse(mcpJson.getBoolean("isError"))
+    val textPayload = JSONObject(mcpJson.getJSONArray("content").getJSONObject(0).getString("text"))
+    assertEquals("PLANNING", textPayload.getString("status"))
   }
 
   @Test

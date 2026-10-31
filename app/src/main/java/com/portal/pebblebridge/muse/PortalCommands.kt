@@ -36,7 +36,10 @@ class CommandError(message: String) : Exception(message)
 object PortalCommands {
   @Volatile private var appContext: Context? = null
 
-  fun init(context: Context) { appContext = context.applicationContext }
+  fun init(context: Context) {
+    appContext = context.applicationContext
+    PortalAniClient.init(context)
+  }
 
   private fun ok(result: String) = JSONObject().put("result", result)
 
@@ -128,6 +131,86 @@ object PortalCommands {
     ) { _ ->
       DeviceEvents.emit(DeviceEvent.Celebrate)
       ok("The robot is celebrating.")
+    },
+    PortalCommand(
+      "portal.anilist_lists",
+      "Use when asked about the user's anime lists on AniList or Portal Ani (what anime they are watching, planning to watch, completed, paused, or dropped).",
+      optional = listOf(
+        CommandParam("status", "string", "List status: CURRENT (or WATCHING), PLANNING, COMPLETED, PAUSED, DROPPED, REPEATING, or ALL. Default CURRENT."),
+        CommandParam("query", "string", "Optional title or genre filter."),
+        CommandParam("limit", "integer", "Max anime to return, 1 to 50. Default 25."),
+        CommandParam("refresh", "boolean", "If true, bypass the 24h local cache and fetch fresh from AniList. Default false."),
+      ),
+    ) { p ->
+      val req = JSONObject()
+        .put("status", p.optString("status", "CURRENT"))
+        .put("query", p.optString("query"))
+        .put("limit", p.optInt("limit", 25).coerceIn(1, 50))
+        .put("refresh", p.optBoolean("refresh", p.optBoolean("forceRefresh", false)))
+      val res = PortalAniClient.call("lists", req)
+      if (!res.optBoolean("ok", true)) throw CommandError(res.optString("error", "AniList lists lookup failed"))
+      res
+    },
+    PortalCommand(
+      "portal.anilist_airing",
+      "Use when asked what anime episodes are airing today or this week on AniList or Portal Ani, or when the next episode airs.",
+      optional = listOf(
+        CommandParam("days", "integer", "Days ahead from today, 1 to 14. Default 7."),
+        CommandParam("only_my_list", "boolean", "If true, only return episodes for anime on the user's AniList. Default false."),
+        CommandParam("limit", "integer", "Max episodes to return, 1 to 50. Default 30."),
+        CommandParam("refresh", "boolean", "If true, bypass the 24h local cache and fetch fresh from AniList. Default false."),
+      ),
+    ) { p ->
+      val req = JSONObject()
+        .put("days", p.optInt("days", 7).coerceIn(1, 14))
+        .put("onlyMyList", p.optBoolean("only_my_list", p.optBoolean("onlyMyList", false)))
+        .put("limit", p.optInt("limit", 30).coerceIn(1, 50))
+        .put("refresh", p.optBoolean("refresh", p.optBoolean("forceRefresh", false)))
+      val res = PortalAniClient.call("airing", req)
+      if (!res.optBoolean("ok", true)) throw CommandError(res.optString("error", "AniList airing schedule lookup failed"))
+      res
+    },
+    PortalCommand(
+      "portal.anilist_search",
+      "Use when asked to search for an anime on AniList or get details, synopsis, score, or airing status for an anime title via Portal Ani.",
+      required = listOf(CommandParam("query", "string", "Anime title to search on AniList.")),
+      optional = listOf(CommandParam("limit", "integer", "Max results, 1 to 10. Default 5.")),
+    ) { p ->
+      val query = p.optString("query").trim().ifEmpty { throw CommandError("query is empty") }
+      val req = JSONObject()
+        .put("query", query)
+        .put("limit", p.optInt("limit", 5).coerceIn(1, 10))
+      val res = PortalAniClient.call("search", req)
+      if (!res.optBoolean("ok", true)) throw CommandError(res.optString("error", "AniList search failed"))
+      res
+    },
+    PortalCommand(
+      "portal.anilist_update",
+      "Use when asked to update an anime on the user's AniList (mark episodes watched/progress, change status to WATCHING/PLANNING/COMPLETED/PAUSED/DROPPED, or score an anime).",
+      required = listOf(CommandParam("media_id", "integer", "AniList media ID of the anime (use portal.anilist_search or portal.anilist_lists first if needed).")),
+      optional = listOf(
+        CommandParam("status", "string", "CURRENT (or WATCHING), PLANNING, COMPLETED, PAUSED, DROPPED, or REPEATING."),
+        CommandParam("progress", "integer", "Number of episodes watched (>= 0)."),
+        CommandParam("score", "number", "Score from 0 to 10."),
+      ),
+    ) { p ->
+      val mediaId = p.optInt("media_id", p.optInt("mediaId", 0))
+      if (mediaId <= 0) throw CommandError("media_id must be a positive integer")
+      val req = JSONObject().put("mediaId", mediaId)
+      p.optString("status").trim().takeIf { it.isNotEmpty() && it != "null" }?.let { req.put("status", it) }
+      if (p.has("progress") && !p.isNull("progress")) {
+        val prog = p.optInt("progress", -1)
+        if (prog < 0) throw CommandError("progress must be an integer >= 0")
+        req.put("progress", prog)
+      }
+      if (p.has("score") && !p.isNull("score")) {
+        val sc = p.optDouble("score", -1.0)
+        if (sc.isNaN() || sc !in 0.0..10.0) throw CommandError("score must be a number between 0 and 10")
+        req.put("score", sc)
+      }
+      val res = PortalAniClient.call("update_list", req)
+      if (!res.optBoolean("ok", true)) throw CommandError(res.optString("error", "AniList update failed"))
+      res
     },
   )
 

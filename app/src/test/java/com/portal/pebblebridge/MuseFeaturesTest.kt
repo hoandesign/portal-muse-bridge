@@ -175,7 +175,39 @@ class MuseFeaturesTest {
     val timer = spec.getJSONObject("portal.start_timer")
     assertEquals("integer", timer.getJSONObject("required").getJSONObject("seconds").getString("type"))
     assertTrue(timer.has("optional"))
+    assertTrue(spec.has("portal.anilist_lists"))
+    assertTrue(spec.has("portal.anilist_airing"))
+    assertTrue(spec.has("portal.anilist_search"))
+    assertTrue(spec.has("portal.anilist_update"))
     assertEquals(0, PortalCommands.registerSpec(enabled = false).length())
+  }
+
+  @Test fun `anilist commands forward to PortalAniClient`() {
+    com.portal.pebblebridge.muse.PortalAniClient.testHandler = { action, params ->
+      JSONObject()
+        .put("ok", true)
+        .put("action", action)
+        .put("status", params.optString("status"))
+        .put("mediaId", params.optInt("mediaId"))
+        .put("progress", params.optInt("progress"))
+    }
+    try {
+      val lists = PortalCommands.invoke("portal.anilist_lists", JSONObject().put("status", "WATCHING"))
+      assertTrue(lists.getBoolean("ok"))
+      assertEquals("WATCHING", lists.getJSONObject("payload").getString("status"))
+
+      val upd = PortalCommands.invoke("portal.anilist_update", JSONObject().put("media_id", 154587).put("progress", 12))
+      assertTrue(upd.getBoolean("ok"))
+      assertEquals(154587, upd.getJSONObject("payload").getInt("mediaId"))
+      assertEquals(12, upd.getJSONObject("payload").getInt("progress"))
+
+      val badScore = PortalCommands.invoke("portal.anilist_update", JSONObject().put("media_id", 154587).put("score", "not-a-number"))
+      assertFalse(badScore.getBoolean("ok"))
+      val badProg = PortalCommands.invoke("portal.anilist_update", JSONObject().put("media_id", 154587).put("progress", "abc"))
+      assertFalse(badProg.getBoolean("ok"))
+    } finally {
+      com.portal.pebblebridge.muse.PortalAniClient.testHandler = null
+    }
   }
 
   @Test fun `invoke runs a command and reports errors as link result fields`() {

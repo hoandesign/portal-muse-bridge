@@ -3,6 +3,7 @@ package com.portal.pebblebridge.server
 import com.portal.pebblebridge.model.NoteStatus
 import com.portal.pebblebridge.model.VoiceNote
 import com.portal.pebblebridge.muse.MuseDeliveryClient
+import com.portal.pebblebridge.muse.PortalAniClient
 import com.portal.pebblebridge.state.BridgeRepository
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -10,6 +11,7 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.UUID
@@ -120,7 +122,9 @@ class McpHttpServer(
     if (parts.size < 2) return
 
     val method = parts[0].uppercase()
-    val path = parts[1].split("?")[0]
+    val rawUri = parts[1]
+    val path = rawUri.substringBefore('?')
+    val queryString = rawUri.substringAfter('?', "")
 
     val headers = mutableMapOf<String, String>()
     for (i in 1 until lines.size) {
@@ -140,6 +144,10 @@ class McpHttpServer(
     }
 
     val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
+    if (contentLength < 0) {
+      sendResponse(out, 400, "Bad Request", "{\"ok\":false,\"error\":\"Invalid Content-Length\"}", "application/json")
+      return
+    }
     if (contentLength > MAX_BODY_BYTES) {
       val errJson = JSONObject().apply {
         put("error", "Payload Too Large: exceeds 1MB limit")
@@ -162,12 +170,29 @@ class McpHttpServer(
           put("service", "Portal Pebble Muse Bridge")
           put("port", port)
           put("notesReceived", BridgeRepository.serverStatus.value.totalNotesReceived)
+          put(
+            "anilistEndpoints",
+            JSONObject()
+              .put("status", "GET /anilist/status")
+              .put("lists", "GET /anilist/lists?status=CURRENT,PLANNING&limit=50")
+              .put("airing", "GET /anilist/airing?days=7&onlyMyList=false")
+              .put("search", "GET /anilist/search?q=Frieren&limit=10")
+              .put("media", "GET /anilist/media?id=154587&includeRelated=true")
+              .put("updateList", "POST /anilist/list-entry {\"mediaId\":154587,\"status\":\"CURRENT\",\"progress\":5,\"score\":9.0}")
+              .put("favourite", "POST /anilist/favourite {\"mediaId\":154587}")
+              .put("graphql", "POST /anilist/graphql {\"query\":\"...\",\"variables\":{}}")
+              .put("mcp", "POST /api/mcp"),
+          )
         }
         sendResponse(out, 200, "OK", res.toString(), "application/json")
       }
 
       path == "/ingest" && method == "POST" -> {
         handleIngest(headers, body, out)
+      }
+
+      path == "/graphql" || path == "/anilist" || path.startsWith("/anilist/") -> {
+        handleAniListHttp(method, path, queryString, headers, body, out)
       }
 
       (path == "/api/mcp" || path == "/mcp") && method == "POST" -> {
@@ -364,6 +389,10 @@ class McpHttpServer(
               put("required", JSONArray().apply { put("text") })
             })
           })
+          val anilistTools = PortalAniClient.mcpToolsSchema()
+          for (i in 0 until anilistTools.length()) {
+            put(anilistTools.getJSONObject(i))
+          }
         }
         val response = JSONObject().apply {
           put("jsonrpc", "2.0")
@@ -414,6 +443,26 @@ class McpHttpServer(
             put("result", JSONObject().apply {
               put("content", contentArray)
               put("isError", note.status == NoteStatus.FAILED)
+            })
+          }
+          sendResponse(out, 200, "OK", response.toString(), "application/json")
+        } else if (toolName.startsWith("anilist_")) {
+          val resultJson = PortalAniClient.call(toolName, args)
+          val isError =
+            (resultJson.has("ok") && !resultJson.optBoolean("ok", true)) ||
+              (resultJson.has("errors") && resultJson.isNull("data"))
+          val contentArray = JSONArray().apply {
+            put(JSONObject().apply {
+              put("type", "text")
+              put("text", resultJson.toString(2))
+            })
+          }
+          val response = JSONObject().apply {
+            put("jsonrpc", "2.0")
+            put("id", id)
+            put("result", JSONObject().apply {
+              put("content", contentArray)
+              put("isError", isError)
             })
           }
           sendResponse(out, 200, "OK", response.toString(), "application/json")
@@ -492,6 +541,103 @@ class McpHttpServer(
         sendResponse(out, 200, "OK", unknown.toString(), "application/json")
       }
     }
+  }
+
+  private fun handleAniListHttp(
+    method: String,
+    path: String,
+    queryString: String,
+    headers: Map<String, String>,
+    body: String,
+    out: OutputStream,
+  ) {
+    val config = BridgeRepository.config.value
+    if (!checkAuth(headers, config.mcpToken)) {
+      sendResponse(out, 401, "Unauthorized", "{\"ok\":false,\"error\":\"Invalid token\"}", "application/json")
+      return
+    }
+
+    val subPath = if (path == "/graphql") "/graphql" else path.removePrefix("/anilist").ifEmpty { "/status" }
+    val res: JSONObject = when {
+      method == "GET" && (subPath == "/" || subPath == "/status" || subPath == "/health") ->
+        PortalAniClient.call("status", parseQueryParams(queryString))
+      method == "GET" && subPath == "/lists" ->
+        PortalAniClient.call("lists", parseQueryParams(queryString))
+      method == "GET" && (subPath == "/airing" || subPath == "/calendar") ->
+        PortalAniClient.call("airing", parseQueryParams(queryString))
+      method == "GET" && subPath == "/search" ->
+        PortalAniClient.call("search", parseQueryParams(queryString))
+      method == "GET" && subPath == "/media" ->
+        PortalAniClient.call("media", parseQueryParams(queryString))
+      method == "POST" && (subPath == "/list-entry" || subPath == "/update") -> {
+        val params = parseBodyAndQuery(body, queryString) ?: run {
+          sendResponse(out, 400, "Bad Request", "{\"ok\":false,\"error\":\"Invalid JSON body\"}", "application/json")
+          return
+        }
+        PortalAniClient.call("update_list", params)
+      }
+      method == "POST" && subPath == "/favourite" -> {
+        val params = parseBodyAndQuery(body, queryString) ?: run {
+          sendResponse(out, 400, "Bad Request", "{\"ok\":false,\"error\":\"Invalid JSON body\"}", "application/json")
+          return
+        }
+        PortalAniClient.call("toggle_favourite", params)
+      }
+      method == "POST" && subPath == "/graphql" -> {
+        val params = parseBodyAndQuery(body, queryString) ?: run {
+          sendResponse(out, 400, "Bad Request", "{\"ok\":false,\"error\":\"Invalid JSON body\"}", "application/json")
+          return
+        }
+        PortalAniClient.call("graphql", params)
+      }
+      else -> {
+        sendResponse(out, 404, "Not Found", "{\"ok\":false,\"error\":\"Unknown AniList endpoint: $path\"}", "application/json")
+        return
+      }
+    }
+
+    val ok = res.optBoolean("ok", true)
+    val statusCode = if (ok) 200 else res.optInt("statusCode", 502)
+    val statusText = when (statusCode) {
+      200 -> "OK"
+      400 -> "Bad Request"
+      401 -> "Unauthorized"
+      404 -> "Not Found"
+      503 -> "Service Unavailable"
+      else -> "Bad Gateway"
+    }
+    sendResponse(out, statusCode, statusText, res.toString(), "application/json")
+  }
+
+  private fun parseQueryParams(queryString: String): JSONObject {
+    val json = JSONObject()
+    if (queryString.isBlank()) return json
+    for (pair in queryString.split('&')) {
+      if (pair.isBlank()) continue
+      val idx = pair.indexOf('=')
+      val rawKey = if (idx >= 0) pair.substring(0, idx) else pair
+      val rawVal = if (idx >= 0) pair.substring(idx + 1) else ""
+      val key = runCatching { URLDecoder.decode(rawKey, "UTF-8") }.getOrDefault(rawKey)
+      val value = runCatching { URLDecoder.decode(rawVal, "UTF-8") }.getOrDefault(rawVal)
+      when {
+        value.equals("true", ignoreCase = true) -> json.put(key, true)
+        value.equals("false", ignoreCase = true) -> json.put(key, false)
+        value.toIntOrNull() != null -> json.put(key, value.toInt())
+        value.toDoubleOrNull() != null -> json.put(key, value.toDouble())
+        else -> json.put(key, value)
+      }
+    }
+    return json
+  }
+
+  private fun parseBodyAndQuery(body: String, queryString: String): JSONObject? {
+    val base = parseQueryParams(queryString)
+    if (body.isBlank()) return base
+    val parsed = runCatching { JSONObject(body) }.getOrNull() ?: return null
+    for (key in parsed.keys()) {
+      base.put(key, parsed.get(key))
+    }
+    return base
   }
 
   private suspend fun processNote(text: String, title: String?): VoiceNote {

@@ -81,6 +81,15 @@ class BridgeService : Service() {
 
     startForeground(NOTIFICATION_ID, buildNotification(localIp, BridgeRepository.config.value.port))
 
+    // Initialize preferences, speaker, history, timers, and PortalCommands BEFORE starting
+    // network/MCP/Noise servers so incoming requests or command registrations see live context.
+    com.portal.pebblebridge.home.HomePrefs.init(this)
+    com.portal.pebblebridge.home.ScreensaverGuard.watch(this)
+    com.portal.pebblebridge.muse.Speaker.init(this)
+    com.portal.pebblebridge.home.History.init(this)
+    com.portal.pebblebridge.home.Timers.init(this)
+    com.portal.pebblebridge.muse.PortalCommands.init(this)
+
     mcpServer = McpHttpServer(port = BridgeRepository.config.value.port)
     mcpServer?.start(serviceScope)
 
@@ -91,14 +100,6 @@ class BridgeService : Service() {
     museLinkClient?.start()
 
     registerNetworkCallback()
-
-    // The Portal launcher resets the screensaver on boot; keep ours registered if enabled.
-    com.portal.pebblebridge.home.HomePrefs.init(this)
-    com.portal.pebblebridge.home.ScreensaverGuard.watch(this)
-    com.portal.pebblebridge.muse.Speaker.init(this)
-    com.portal.pebblebridge.home.History.init(this)
-    com.portal.pebblebridge.home.Timers.init(this)
-    com.portal.pebblebridge.muse.PortalCommands.init(this)
     // Timers and alarms set by Muse ring here, whatever screen is showing.
     serviceScope.launch {
       while (true) {

@@ -491,7 +491,7 @@ class MuseLinkClient(
   private fun runInvoke(id: String, command: String, params: JSONObject?) {
     scope.launch {
       Log.i(TAG, "invoke $command")
-      val result = withContext(Dispatchers.Main) { PortalCommands.invoke(command, params) }
+      val result = withContext(Dispatchers.IO) { PortalCommands.invoke(command, params) }
       val ws = activeWebSocket ?: return@launch
       val msg = JSONObject().put("method", "link.result").put("id", id)
       result.keys().forEach { k -> msg.put(k, result.get(k)) }

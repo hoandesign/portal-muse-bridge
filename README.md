@@ -152,6 +152,10 @@ Ideas and protocol details here come from [hey-muse](https://github.com/wobsoria
 | `portal.set_volume` | Sets the Portal's volume (0–100) |
 | `portal.set_theme` | Switches the color theme |
 | `portal.celebrate` | Makes the robot jump and cheer |
+| `portal.anilist_lists` | Fetches your anime lists (watching, planning, completed, …) from Portal Ani |
+| `portal.anilist_airing` | Fetches today's or this week's airing anime schedule from Portal Ani |
+| `portal.anilist_search` | Searches anime on AniList via Portal Ani |
+| `portal.anilist_update` | Updates an anime's status, watched episode progress, or score on your AniList |
 
 The Portal shows up in Muse as **Portal**. Say "on my Portal" so Muse uses these rather than your phones' own alarm and reminder commands. Timers and alarms are saved, so they survive restarts.
 
@@ -162,7 +166,14 @@ Nothing here runs shell commands, reads files or reaches other devices. Turn any
 | Path | Use |
 |---|---|
 | `POST /ingest` | Pebble Index Webhook (multipart form, `transcription` field), JSON `{"text": …}`, or plain text |
-| `POST /api/mcp` | MCP (Streamable HTTP) with a `send_muse_note` tool, for agents |
+| `POST /api/mcp` | MCP (Streamable HTTP) with `send_muse_note` and `anilist_*` tools, for agents |
+| `GET /anilist/status` | Portal Ani sign-in status, viewer profile, and settings |
+| `GET /anilist/lists` | Your AniList lists (`?status=CURRENT,PLANNING&limit=50`) via Portal Ani |
+| `GET /anilist/airing` | Upcoming airing episodes (`?days=7&onlyMyList=false`) via Portal Ani |
+| `GET /anilist/search` | Search anime on AniList (`?q=Frieren&limit=10`) via Portal Ani |
+| `GET /anilist/media` | Full anime details (`?id=154587&includeRelated=true`) via Portal Ani |
+| `POST /anilist/list-entry` | Update list status, episode progress, or score (`{"mediaId": 154587, "status": "CURRENT", "progress": 5, "score": 9}`) |
+| `POST /anilist/graphql` | Authenticated AniList GraphQL v2 proxy using Portal Ani's session & home IP |
 | `GET /health` | Status check |
 
 Set an **MCP token** in **Settings → ⚙ Connection** to require `Authorization: Bearer <token>` (or `X-Pebble-Token`) on `/ingest` and `/api/mcp`. In the Pebble webhook, add it as a header. Without a token, anyone who can reach the Portal can post notes.

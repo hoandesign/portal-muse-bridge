@@ -91,6 +91,7 @@ class MainActivity : ComponentActivity() {
     super.onCreate(savedInstanceState)
     BridgeRepository.initPersistence(this)
     com.portal.pebblebridge.home.HomePrefs.init(this)
+    com.portal.pebblebridge.muse.PortalCommands.init(this)
     BridgeService.start(this)
     applyDreamMode(intent)
     hideSystemBars()
@@ -274,8 +275,9 @@ fun BridgeScreen(
             if (tailscaleIp != null) {
               Text("Anywhere (Tailscale):", fontSize = 12.sp, color = Color(0xFFD4D4D8))
               Text("http://$tailscaleIp:${serverStatus.port}/ingest", fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Color(0xFF60A5FA))
+              Text("AniList Bridge (Tailscale): http://$tailscaleIp:${serverStatus.port}/anilist/graphql", fontSize = 11.sp, color = Color(0xFF34D399))
             }
-            Text("MCP (for agents): $mcpUrl", fontSize = 11.sp, color = Color(0xFF71717A))
+            Text("MCP (Notes + AniList tools): $mcpUrl", fontSize = 11.sp, color = Color(0xFF71717A))
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
               Button(
