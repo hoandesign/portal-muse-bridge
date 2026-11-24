@@ -82,7 +82,7 @@ class MuseDeliveryClient(
         if (result.isFailure && config.museRefreshToken.isNotBlank()) {
           val ex = result.exceptionOrNull()
           if (ex is IOException && ex.message?.contains("401") == true) {
-            val effectiveDeviceId = deviceId.ifBlank { BridgeRepository.deviceId }
+            val effectiveDeviceId = deviceId.ifBlank { BridgeRepository.nodeId }
             val refreshResult = refreshAccessToken(config, effectiveDeviceId)
             if (refreshResult.isSuccess) {
               val newAccessToken = refreshResult.getOrThrow()
@@ -146,13 +146,25 @@ class MuseDeliveryClient(
     }
   }
 
+  /**
+   * Rotates the device token pair with the refresh token (never the access token, as upstream).
+   *
+   * [deviceId] must be the node id the pairing was issued for (`homelink-xxxxxx` / `gadget-xxxxxx`),
+   * matching upstream `identity_node_id()` (ESP32) and `identity.node_id` (Linux), not the
+   * `hatch-link:<mac>` device_id used in the BLE pairing transcript.
+   */
   suspend fun refreshAccessToken(
     config: BridgeConfig,
-    deviceId: String,
+    deviceId: String = BridgeRepository.nodeId,
   ): Result<String> = withContext(Dispatchers.IO) {
     val refreshToken = config.museRefreshToken.trim()
     if (refreshToken.isBlank()) {
       return@withContext Result.failure(IllegalStateException("No refresh token available"))
+    }
+    val waitMs = RefreshGate.tryAcquire()
+    if (waitMs > 0) {
+      Log.i(TAG, "Token refresh deferred ${waitMs / 1000}s (rate pacing)")
+      return@withContext Result.failure(IOException("Token refresh deferred ${waitMs / 1000}s"))
     }
     try {
       val rawRefresh = refreshToken.substringAfterLast(":")
@@ -180,6 +192,13 @@ class MuseDeliveryClient(
 
       httpClient.newCall(request).execute().use { response ->
         if (!response.isSuccessful) {
+          RefreshGate.onFailure(RefreshGate.parseRetryAfterMs(response.header("Retry-After")))
+          val errBody = response.body?.string().orEmpty().take(200)
+          if (response.code == 401) {
+            Log.w(TAG, "Token refresh rejected (HTTP 401) for node $deviceId: pairing revoked, re-pair with the Muse app. $errBody")
+          } else {
+            Log.w(TAG, "Token refresh failed: HTTP ${response.code}; next attempt in ${RefreshGate.remainingMs() / 1000}s. $errBody")
+          }
           return@withContext Result.failure(
             IOException("Token refresh rejected: HTTP ${response.code}")
           )
@@ -196,12 +215,18 @@ class MuseDeliveryClient(
               museRefreshToken = newRefresh.ifBlank { refreshToken },
             )
           )
+          RefreshGate.onSuccess()
+          Log.i(TAG, "Device token rotated for node $deviceId")
           Result.success(newAccess)
         } else {
+          RefreshGate.onFailure()
+          Log.w(TAG, "Token refresh response missing access_token")
           Result.failure(IOException("Missing access_token in refresh response"))
         }
       }
     } catch (e: Exception) {
+      RefreshGate.onFailure()
+      Log.w(TAG, "Token refresh failed: ${e.javaClass.simpleName}: ${e.message}")
       Result.failure(e)
     }
   }

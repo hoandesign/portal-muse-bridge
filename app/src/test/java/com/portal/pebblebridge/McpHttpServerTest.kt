@@ -24,7 +24,7 @@ import org.junit.Test
 
 class McpHttpServerTest {
 
-  private val testPort = 18787
+  private var testPort = 0
   private val testScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private lateinit var server: McpHttpServer
 
@@ -32,9 +32,19 @@ class McpHttpServerTest {
   fun setUp() = runBlocking {
     BridgeRepository.clearNotes()
     BridgeRepository.updateConfig(BridgeConfig())
+    testPort = java.net.ServerSocket(0).use { it.localPort }
     server = McpHttpServer(port = testPort)
     server.start(testScope)
-    delay(200) // Give server a moment to bind
+    val deadline = System.currentTimeMillis() + 5_000L
+    while (System.currentTimeMillis() < deadline) {
+      val ready = try {
+        java.net.Socket("127.0.0.1", testPort).use { true }
+      } catch (_: Exception) {
+        false
+      }
+      if (ready) break
+      delay(25)
+    }
   }
 
   @After
