@@ -41,11 +41,15 @@ jobs:
         env:
           DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
         run: |
+          ANDROID_USER_HOME="$HOME/.android"
+          echo "ANDROID_USER_HOME=$ANDROID_USER_HOME" >> "$GITHUB_ENV"
+          mkdir -p "$ANDROID_USER_HOME"
           if [ -n "$DEBUG_KEYSTORE_BASE64" ]; then
-            mkdir -p "$HOME/.android"
-            printf '%s' "$DEBUG_KEYSTORE_BASE64" | base64 --decode > "$HOME/.android/debug.keystore"
-            chmod 600 "$HOME/.android/debug.keystore"
-            echo "Restored shared debug.keystore"
+            printf '%s' "$DEBUG_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_USER_HOME/debug.keystore"
+            chmod 600 "$ANDROID_USER_HOME/debug.keystore"
+            KS_SHA256=$(keytool -list -v -keystore "$ANDROID_USER_HOME/debug.keystore" -storepass android | awk '/SHA256:/{gsub(/:/,"",$2); print tolower($2); exit}')
+            echo "EXPECTED_APK_SHA256=$KS_SHA256" >> "$GITHUB_ENV"
+            echo "Restored shared debug.keystore (SHA-256 prefix: ${KS_SHA256:0:12})"
           else
             echo "DEBUG_KEYSTORE_BASE64 not set; using ephemeral runner debug.keystore"
           fi
@@ -54,7 +58,17 @@ jobs:
         run: ./gradlew testDebugUnitTest --no-daemon
 
       - name: Build debug APK
-        run: ./gradlew assembleDebug --no-daemon
+        run: |
+          ./gradlew assembleDebug --no-daemon
+          if [ -n "${EXPECTED_APK_SHA256:-}" ]; then
+            APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
+            ACTUAL_SHA256=$("$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/app-debug.apk | awk '/SHA-256 digest:/{print tolower($NF); exit}')
+            echo "APK cert SHA-256 prefix: ${ACTUAL_SHA256:0:12}"
+            if [ "$ACTUAL_SHA256" != "$EXPECTED_APK_SHA256" ]; then
+              echo "::error::APK signing cert ($ACTUAL_SHA256) does not match restored debug.keystore ($EXPECTED_APK_SHA256)"
+              exit 1
+            fi
+          fi
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
