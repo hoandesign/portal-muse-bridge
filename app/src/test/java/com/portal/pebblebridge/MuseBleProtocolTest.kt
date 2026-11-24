@@ -517,4 +517,75 @@ class MuseBleProtocolTest {
     val mgr = MuseBleManager(context)
     assertEquals("BridgeRepository bleDeviceName must synchronize with manager.bleName", mgr.bleName, com.portal.pebblebridge.state.BridgeRepository.bleDeviceName.value)
   }
+
+  @Test
+  fun testPairedNodeIdPreservesLegacyAndStoredIdsPerUpstream414() {
+    val prefs = context.getSharedPreferences("portal_pebble_bridge_prefs", Context.MODE_PRIVATE)
+    prefs.edit().clear().apply()
+
+    // 1. Pre-existing pairing (paired=true, no stored node_id) MUST keep homelink- even if gadget- switch is on
+    prefs.edit().putBoolean("pref_is_paired", true).apply()
+    com.portal.pebblebridge.state.BridgeRepository.resetForTesting()
+    com.portal.pebblebridge.state.BridgeRepository.initPersistence(context)
+    val legacyPairedMgr = MuseBleManager(context, useGadgetNodeId = true)
+    assertEquals("gadget-" + legacyPairedMgr.deviceSuffix, legacyPairedMgr.setupNodeId)
+    assertEquals("Pre-existing pairing must keep homelink- node_id", "homelink-" + legacyPairedMgr.deviceSuffix, legacyPairedMgr.nodeId)
+    assertEquals("homelink-" + legacyPairedMgr.deviceSuffix, com.portal.pebblebridge.state.BridgeRepository.nodeId)
+
+    // 2. Unpairing / restarting pairing clears stored id so new setup offers setupNodeId (gadget- when enabled)
+    legacyPairedMgr.restartPairingMode()
+    assertEquals("gadget-" + legacyPairedMgr.deviceSuffix, legacyPairedMgr.nodeId)
+    assertEquals("gadget-" + legacyPairedMgr.deviceSuffix, com.portal.pebblebridge.state.BridgeRepository.nodeId)
+
+    // 3. Storing a gadget- node_id with pairing keeps it across restarts even if switch is turned back off
+    val storedId = "gadget-" + legacyPairedMgr.deviceSuffix
+    com.portal.pebblebridge.state.BridgeRepository.setPairedNodeId(storedId)
+    com.portal.pebblebridge.state.BridgeRepository.setPaired(true)
+
+    com.portal.pebblebridge.state.BridgeRepository.resetForTesting()
+    com.portal.pebblebridge.state.BridgeRepository.initPersistence(context)
+    val rebootedMgr = MuseBleManager(context, useGadgetNodeId = false)
+    assertEquals("Stored gadget- node_id must survive restart", storedId, rebootedMgr.nodeId)
+    assertEquals(storedId, com.portal.pebblebridge.state.BridgeRepository.nodeId)
+
+    // 4. Invalid node_id is rejected by setPairedNodeId
+    assertThrows(IllegalArgumentException::class.java) {
+      com.portal.pebblebridge.state.BridgeRepository.setPairedNodeId("INVALID_ID")
+    }
+
+    // 5. Stored pref_paired_node_id is ignored when pref_is_paired=false or malformed
+    prefs.edit()
+      .putBoolean("pref_is_paired", false)
+      .putString("pref_paired_node_id", storedId)
+      .apply()
+    com.portal.pebblebridge.state.BridgeRepository.resetForTesting()
+    com.portal.pebblebridge.state.BridgeRepository.initPersistence(context)
+    assertEquals("", com.portal.pebblebridge.state.BridgeRepository.pairedNodeId)
+
+    prefs.edit()
+      .putBoolean("pref_is_paired", true)
+      .putString("pref_paired_node_id", "bad!")
+      .apply()
+    com.portal.pebblebridge.state.BridgeRepository.resetForTesting()
+    com.portal.pebblebridge.state.BridgeRepository.initPersistence(context)
+    assertEquals("", com.portal.pebblebridge.state.BridgeRepository.pairedNodeId)
+
+    // 6. restartPairingMode preserves active BridgeRepository.nodeId while old access token is still live
+    val priorConfig = com.portal.pebblebridge.state.BridgeRepository.config.value
+    try {
+      com.portal.pebblebridge.state.BridgeRepository.updateConfig(
+        priorConfig.copy(museAccessToken = "live-token")
+      )
+      com.portal.pebblebridge.state.BridgeRepository.nodeId = "homelink-" + rebootedMgr.deviceSuffix
+      val gadgetMgr = MuseBleManager(context, useGadgetNodeId = true)
+      gadgetMgr.restartPairingMode()
+      assertEquals(
+        "Active nodeId must not switch to gadget- while old access token is still live",
+        "homelink-" + rebootedMgr.deviceSuffix,
+        com.portal.pebblebridge.state.BridgeRepository.nodeId,
+      )
+    } finally {
+      com.portal.pebblebridge.state.BridgeRepository.updateConfig(priorConfig)
+    }
+  }
 }

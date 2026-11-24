@@ -6,25 +6,98 @@ import org.json.JSONObject
 
 /**
  * Splits the /link-control stream into length-prefixed JSON messages (little-endian u32 length).
- * A message may span body chunks, so bytes are buffered until it is complete. Port of the SDK's
+ * Messages and their 4-byte length headers may span multiple BodyChunks (upstream #470), so
+ * partial bytes are buffered for the current session until complete. Port of the SDK's
  * `link_client.MessageDecoder`.
  */
 class ControlDecoder(private val maxMessage: Int = 4 * 1024 * 1024) {
-  private var buf = ByteArray(0)
+  init {
+    require(maxMessage in 0..(Int.MAX_VALUE - 4)) { "invalid maxMessage: $maxMessage" }
+  }
 
+  private var buf = ByteArray(0)
+  private var readPos = 0
+  private var writePos = 0
+
+  /** Bytes currently buffered awaiting the rest of a header or body. */
+  @Synchronized
+  fun pendingBytes(): Int = writePos - readPos
+
+  /** Drops any partial message buffered for an ended session. */
+  @Synchronized
+  fun reset() {
+    buf = ByteArray(0)
+    readPos = 0
+    writePos = 0
+  }
+
+  @Synchronized
   fun feed(data: ByteArray): List<JSONObject> {
-    buf += data
+    if (data.isEmpty()) return emptyList()
+    append(data)
     val out = mutableListOf<JSONObject>()
-    while (buf.size >= 4) {
-      val length = ByteBuffer.wrap(buf, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
-      require(length in 0..maxMessage) { "inbound control message too large: $length" }
-      if (buf.size < 4 + length) break
-      val raw = buf.copyOfRange(4, 4 + length)
-      buf = buf.copyOfRange(4 + length, buf.size)
-      if (raw.isEmpty()) continue // keepalive
-      runCatching { JSONObject(String(raw, Charsets.UTF_8)) }.getOrNull()?.let(out::add)
+    while (writePos - readPos >= 4) {
+      val length = (buf[readPos].toLong() and 0xFF) or
+        ((buf[readPos + 1].toLong() and 0xFF) shl 8) or
+        ((buf[readPos + 2].toLong() and 0xFF) shl 16) or
+        ((buf[readPos + 3].toLong() and 0xFF) shl 24)
+      if (length > maxMessage.toLong()) {
+        reset()
+        throw IllegalArgumentException("inbound control message too large: $length")
+      }
+      val payloadLen = length.toInt()
+      if ((writePos - readPos).toLong() < 4L + length) break
+      val payloadStart = readPos + 4
+      readPos += 4 + payloadLen
+      if (payloadLen == 0) continue // keepalive
+      val parsed = try {
+        JSONObject(String(buf, payloadStart, payloadLen, Charsets.UTF_8))
+      } catch (_: Exception) {
+        null
+      } catch (_: StackOverflowError) {
+        // Drop overdeep JSON records (upstream #329) without stalling subsequent messages.
+        null
+      }
+      if (parsed != null) out.add(parsed)
     }
+    compact()
     return out
+  }
+
+  private fun append(data: ByteArray) {
+    val available = writePos - readPos
+    if (buf.size - writePos < data.size) {
+      if (readPos > 0 && buf.size - available >= data.size) {
+        System.arraycopy(buf, readPos, buf, 0, available)
+        readPos = 0
+        writePos = available
+      } else {
+        val needed = available.toLong() + data.size.toLong()
+        require(needed <= Int.MAX_VALUE.toLong()) { "inbound control buffer overflow" }
+        val doubled = minOf(buf.size.toLong() * 2L, Int.MAX_VALUE.toLong())
+        val nextCap = maxOf(needed, maxOf(doubled, 1024L)).toInt()
+        val grown = ByteArray(nextCap)
+        if (available > 0) System.arraycopy(buf, readPos, grown, 0, available)
+        buf = grown
+        readPos = 0
+        writePos = available
+      }
+    }
+    System.arraycopy(data, 0, buf, writePos, data.size)
+    writePos += data.size
+  }
+
+  private fun compact() {
+    val remaining = writePos - readPos
+    if (remaining == 0) {
+      readPos = 0
+      writePos = 0
+      if (buf.size > 65_536) buf = ByteArray(0)
+    } else if (readPos > 0 && readPos >= buf.size / 2) {
+      System.arraycopy(buf, readPos, buf, 0, remaining)
+      readPos = 0
+      writePos = remaining
+    }
   }
 }
 

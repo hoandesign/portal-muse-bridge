@@ -1,12 +1,11 @@
 package com.portal.pebblebridge.muse
 
 import android.util.Log
+import com.portal.pebblebridge.BuildConfig
 import com.portal.pebblebridge.model.BridgeConfig
 import com.portal.pebblebridge.model.LinkState
 import com.portal.pebblebridge.state.BridgeRepository
 import java.io.IOException
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -60,6 +59,7 @@ class MuseLinkClient(
       .connectTimeout(15, TimeUnit.SECONDS)
       .readTimeout(0, TimeUnit.MILLISECONDS) // Keep WebSocket read open
       .pingInterval(20, TimeUnit.SECONDS)
+      .minWebSocketMessageToCompress(Long.MAX_VALUE) // Noise frames are ciphertext (upstream #317)
       .retryOnConnectionFailure(true)
       .build()
   }
@@ -75,11 +75,16 @@ class MuseLinkClient(
 
   @Volatile
   private var noiseTransport: NoiseTransport? = null
+  @Volatile
   private var controlStreamId: Long = -1
+  @Volatile
   private var subscribeStreamId: Long = -1
   @Volatile private var subscribeOpen = false
+  @Volatile
   private var registerId = ""
+  @Volatile
   private var controlDecoder = ControlDecoder()
+  @Volatile
   private var subscribeLines = LineBuffer()
   /** Request streams waiting for their whole response (e.g. the /chat/stream acknowledgment). */
   private val pendingRequests = ConcurrentHashMap<Long, PendingRequest>()
@@ -87,6 +92,8 @@ class MuseLinkClient(
   private val sendLock = Any()
   /** The questions whose answers we're collecting from /chat/subscribe. */
   private val router = TurnRouter()
+
+  internal enum class ControlSendResult { SENT, TOO_LARGE, NOT_CONNECTED, FAILED }
 
   /** Collects one request stream's response until end of body. */
   class PendingRequest {
@@ -129,14 +136,58 @@ class MuseLinkClient(
     setLinkState(LinkState.DISCONNECTED)
   }
 
+  /**
+   * Resets session state. When [expectedSocket] is non-null, does nothing and returns `false` if a
+   * newer WebSocket has already replaced it, preventing stale callbacks from clobbering a live session.
+   */
+  internal fun resetSessionState(expectedSocket: WebSocket? = null): Boolean {
+    synchronized(sendLock) {
+      if (expectedSocket != null && expectedSocket !== activeWebSocket) {
+        return false
+      }
+      if (expectedSocket != null) {
+        activeWebSocket = null
+        noiseTransport = null
+      }
+      controlDecoder.reset()
+      subscribeLines = LineBuffer()
+      controlStreamId = -1
+      subscribeStreamId = -1
+      subscribeOpen = false
+      registerId = ""
+    }
+    failPendingRequests()
+    return true
+  }
+
+  private fun failPendingRequests() {
+    val iter = pendingRequests.entries.iterator()
+    while (iter.hasNext()) {
+      val entry = iter.next()
+      iter.remove()
+      entry.value.done.completeExceptionally(IOException("Noise session closed"))
+    }
+  }
+
   private fun closeWebSocket() {
+    val ws = synchronized(sendLock) {
+      val current = activeWebSocket
+      activeWebSocket = null
+      noiseTransport = null
+      controlDecoder.reset()
+      subscribeLines = LineBuffer()
+      controlStreamId = -1
+      subscribeStreamId = -1
+      subscribeOpen = false
+      registerId = ""
+      current
+    }
+    failPendingRequests()
     try {
-      activeWebSocket?.close(1000, "Normal closure")
+      ws?.close(1000, "Normal closure")
     } catch (e: Exception) {
       Log.w(TAG, "Error closing websocket", e)
     }
-    activeWebSocket = null
-    noiseTransport = null
   }
 
   private suspend fun runClientLoop() {
@@ -155,7 +206,7 @@ class MuseLinkClient(
 
       try {
         setLinkState(LinkState.FETCHING_VM)
-        Log.i(TAG, "Fetching VMs from Meta cloud for token ${token.take(8)}...")
+        Log.i(TAG, "Fetching VMs from Meta cloud (token length=${token.length})")
         val vm = fetchVm(config)
         if (vm == null) {
           Log.w(TAG, "No active VM found; retrying in ${backoffMs / 1000}s")
@@ -205,7 +256,7 @@ class MuseLinkClient(
       .url(url)
       .addHeader("Authorization", "Bearer ${config.museAccessToken}")
       .addHeader("X-API-Version", "1.0.0")
-      .addHeader("User-Agent", "musegadget/1.0.0 (Android)")
+      .addHeader("User-Agent", "musegadget/${BuildConfig.VERSION_NAME} (Android)")
       .get()
       .build()
 
@@ -258,11 +309,11 @@ class MuseLinkClient(
     val host = BridgeRepository.config.value.museNoiseHost.ifBlank { DEFAULT_NOISE_HOST }
     val wsUrl = "wss://$host/v1/noise?vm_id=${java.net.URLEncoder.encode(vm.vmId, "UTF-8")}"
 
-    Log.i(TAG, "Connecting WebSocket to $wsUrl with bearer ${vm.vmAuthToken.take(10)}...")
+    Log.i(TAG, "Connecting WebSocket to $wsUrl")
     val req = Request.Builder()
       .url(wsUrl)
       .addHeader("Authorization", "Bearer ${vm.vmAuthToken}")
-      .addHeader("User-Agent", "musegadget/1.0.0 (Android)")
+      .addHeader("User-Agent", "musegadget/${BuildConfig.VERSION_NAME} (Android)")
       .build()
 
     val initiator = NoiseXXInitiator()
@@ -270,8 +321,10 @@ class MuseLinkClient(
 
     val listener = object : WebSocketListener() {
       private var step = 1
+      @Volatile private var sessionTransport: NoiseTransport? = null
 
       override fun onOpen(webSocket: WebSocket, response: Response) {
+        if (webSocket !== activeWebSocket) return
         Log.i(TAG, "WebSocket open; initiating Noise XX handshake step 1...")
         setLinkState(LinkState.HANDSHAKING)
         val msg1 = initiator.writeMessage1()
@@ -279,6 +332,7 @@ class MuseLinkClient(
       }
 
       override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+        if (webSocket !== activeWebSocket) return
         val raw = bytes.toByteArray()
         when (step) {
           1 -> {
@@ -288,12 +342,26 @@ class MuseLinkClient(
               webSocket.send(msg3.toByteString())
 
               val (sendCipher, recvCipher) = initiator.split()
-              noiseTransport = NoiseTransport(sendCipher, recvCipher)
+              val transport = NoiseTransport(sendCipher, recvCipher)
+              sessionTransport = transport
+              val installed = synchronized(sendLock) {
+                if (webSocket !== activeWebSocket) {
+                  false
+                } else {
+                  noiseTransport = transport
+                  true
+                }
+              }
+              if (!installed) return
               Log.i(TAG, "Noise XX handshake completed successfully!")
 
               step = 2
               setLinkState(LinkState.REGISTERING)
-              openControlStream(webSocket)
+              if (!openControlStream(webSocket)) {
+                completion.complete(false)
+                if (!disconnection.isCompleted) disconnection.complete(Unit)
+                return
+              }
               setLinkState(LinkState.CONNECTED_ONLINE)
               completion.complete(true)
             } catch (e: Exception) {
@@ -303,10 +371,11 @@ class MuseLinkClient(
             }
           }
           else -> {
-            // Established Noise transport frame
+            // Established Noise transport frame (always decrypt with this socket's own transport)
             try {
-              val transport = noiseTransport ?: return
+              val transport = sessionTransport ?: return
               val frame = transport.decryptFrame(raw) ?: return
+              if (webSocket !== activeWebSocket) return
               handleInboundFrame(frame)
             } catch (e: Exception) {
               Log.e(TAG, "Failed to decrypt incoming Noise frame; closing compromised connection", e)
@@ -319,14 +388,18 @@ class MuseLinkClient(
 
       override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
         Log.w(TAG, "WebSocket failure: ${t.message} (HTTP ${response?.code})")
-        setLinkState(LinkState.ERROR)
+        if (resetSessionState(webSocket)) {
+          setLinkState(LinkState.ERROR)
+        }
         if (!completion.isCompleted) completion.complete(false)
         if (!disconnection.isCompleted) disconnection.complete(Unit)
       }
 
       override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
         Log.i(TAG, "WebSocket closed: code=$code reason=$reason")
-        setLinkState(LinkState.DISCONNECTED)
+        if (resetSessionState(webSocket)) {
+          setLinkState(LinkState.DISCONNECTED)
+        }
         if (!completion.isCompleted) completion.complete(false)
         if (!disconnection.isCompleted) disconnection.complete(Unit)
       }
@@ -335,52 +408,64 @@ class MuseLinkClient(
     activeWebSocket = sharedClient.newWebSocket(req, listener)
   }
 
-  private fun openControlStream(ws: WebSocket) {
-    val transport = noiseTransport ?: return
-    val (streamId, frames) = synchronized(sendLock) { transport.startStreamRequest("POST", "/link-control") }
-    controlStreamId = streamId
-    controlDecoder = ControlDecoder()
-
-    // Send HTTP stream start frames
-    for (frame in frames) {
-      ws.send(frame.toByteString())
+  private fun openControlStream(ws: WebSocket): Boolean {
+    val started = synchronized(sendLock) {
+      if (ws !== activeWebSocket) return@synchronized false
+      val transport = noiseTransport ?: return@synchronized false
+      val (streamId, frames) = transport.startStreamRequest("POST", "/link-control")
+      controlStreamId = streamId
+      controlDecoder = ControlDecoder()
+      for (frame in frames) {
+        ws.send(frame.toByteString())
+      }
+      true
     }
+    if (!started) return false
 
     val currentNodeId = BridgeRepository.nodeId.ifBlank { "homelink-e1890c" }
-    // "Portal", so Muse connects "my Portal" with this gadget (it otherwise guesses Meta Portal's own assistant).
-    val currentDisplayName = "Portal"
-
-    // Send link.register message
+    val commands = PortalCommands.registerSpec()
     val registerId = UUID.randomUUID().toString()
-    val registerObj = JSONObject().apply {
-      put("type", "req")
-      put("id", registerId)
-      put("method", "link.register")
-      put("params", JSONObject().apply {
-        put("node_id", currentNodeId)
-        put("display_name", currentDisplayName)
-        // The values Meta's Linux SDK sends; the Muse VM knows these (as hey-muse notes). Unknown
-        // ones were accepted but Muse's model was not offered our commands.
-        put("platform", "linux")
-        put("version", "1.0.0")
-        put("device_family", "homehub")
-        put("model_id", "linux")
-        put("is_wakeup_supported", false)
-        put("commands_v2", PortalCommands.registerSpec())
-      })
-    }
+    val registerObj = DeviceGuide.registerMessage(
+      requestId = registerId,
+      nodeId = currentNodeId,
+      displayName = DeviceGuide.DISPLAY_NAME,
+      version = BuildConfig.VERSION_NAME,
+      commands = commands,
+    )
     this.registerId = registerId
-    sendControl(ws, registerObj)
-    Log.i(TAG, "Sent link.register as $currentNodeId ($currentDisplayName) with ${PortalCommands.registerSpec().length()} commands")
+    if (sendControl(ws, registerObj) != ControlSendResult.SENT) {
+      Log.e(TAG, "Failed to send link.register; closing control session")
+      ws.close(1000, "link.register send failed")
+      return false
+    }
+    Log.i(
+      TAG,
+      "Sent link.register as $currentNodeId (${DeviceGuide.DISPLAY_NAME}, family=${DeviceGuide.DEVICE_FAMILY}, model=${DeviceGuide.MODEL_ID}) with ${commands.length()} commands"
+    )
     openSubscribe(ws)
+    return true
   }
 
   /** Length-prefixed JSON on the control stream (link.register, link.result). */
-  private fun sendControl(ws: WebSocket, message: JSONObject) {
-    val transport = noiseTransport ?: return
+  internal fun sendControl(ws: WebSocket, message: JSONObject): ControlSendResult {
+    val prefixed = NoiseTransport.encodeLengthPrefixedMessage(message.toString().toByteArray(Charsets.UTF_8))
+    if (prefixed.size > DeviceGuide.MAX_CONTROL_MESSAGE_BYTES) {
+      Log.e(TAG, "Control message exceeds ${DeviceGuide.MAX_CONTROL_MESSAGE_BYTES} byte budget (${prefixed.size} bytes)")
+      return ControlSendResult.TOO_LARGE
+    }
     synchronized(sendLock) {
-      val prefixed = NoiseTransport.encodeLengthPrefixedMessage(message.toString().toByteArray(Charsets.UTF_8))
-      transport.encryptBodyChunk(controlStreamId, prefixed).forEach { ws.send(it.toByteString()) }
+      if (ws !== activeWebSocket) return ControlSendResult.NOT_CONNECTED
+      val transport = noiseTransport ?: return ControlSendResult.NOT_CONNECTED
+      val sid = controlStreamId
+      if (sid <= 0L) return ControlSendResult.NOT_CONNECTED
+      return try {
+        transport.encryptBodyChunk(sid, prefixed).forEach { ws.send(it.toByteString()) }
+        ControlSendResult.SENT
+      } catch (e: Exception) {
+        Log.e(TAG, "Failed to encrypt/send control message", e)
+        ws.close(1008, "control send failed")
+        ControlSendResult.FAILED
+      }
     }
   }
 
@@ -395,8 +480,9 @@ class MuseLinkClient(
    * arrive here, not on the /chat/stream request (which only acknowledges). From hey-muse.
    */
   private fun openSubscribe(ws: WebSocket) {
-    val transport = noiseTransport ?: return
     synchronized(sendLock) {
+      if (ws !== activeWebSocket) return
+      val transport = noiseTransport ?: return
       val (sid, frames) = transport.startStreamRequest("POST", "/chat/subscribe", jsonHeaders(NoiseHeader("accept", "application/x-ndjson")))
       subscribeStreamId = sid
       subscribeLines = LineBuffer()
@@ -410,7 +496,26 @@ class MuseLinkClient(
     Log.i(TAG, "Opened /chat/subscribe on stream $subscribeStreamId")
   }
 
-  private fun handleInboundFrame(frame: ServiceFrame) {
+  internal fun attachSessionForTesting(
+    ws: WebSocket,
+    transport: NoiseTransport,
+    controlStreamId: Long,
+    registerId: String = "",
+    subscribeStreamId: Long = -1L,
+  ) {
+    synchronized(sendLock) {
+      activeWebSocket = ws
+      noiseTransport = transport
+      this.controlStreamId = controlStreamId
+      this.subscribeStreamId = subscribeStreamId
+      this.subscribeOpen = subscribeStreamId > 0L
+      this.registerId = registerId
+      controlDecoder = ControlDecoder()
+      subscribeLines = LineBuffer()
+    }
+  }
+
+  internal fun handleInboundFrame(frame: ServiceFrame) {
     val (status, data, ended) = when (val p = frame.payload) {
       is ServiceFramePayload.Resp -> Triple(p.response.status, p.response.body, p.response.endBody)
       is ServiceFramePayload.Chunk -> Triple(0, p.chunk.data, p.chunk.endBody)
@@ -427,11 +532,26 @@ class MuseLinkClient(
     }
     when (frame.streamId) {
       controlStreamId -> {
-        if (status >= 400) Log.w(TAG, "/link-control refused: HTTP $status")
-        try {
-          controlDecoder.feed(data).forEach(::handleControl)
+        if (frame.payload is ServiceFramePayload.Resp && status !in 200..299) {
+          Log.w(TAG, "/link-control refused: HTTP $status")
+          activeWebSocket?.close(1000, "control stream refused: HTTP $status")
+          return
+        }
+        val messages = try {
+          controlDecoder.feed(data)
         } catch (e: Exception) {
-          Log.w(TAG, "bad control stream data", e)
+          Log.w(TAG, "bad control stream data; closing session to reconnect", e)
+          activeWebSocket?.close(1008, "bad control stream data")
+          return
+        }
+        for (m in messages) {
+          if (!handleControl(m)) return
+        }
+        // Upstream #470: end_body on /link-control's Response or BodyChunk means the VM closed the
+        // control channel and this device is no longer registered; close so the loop reconnects.
+        if (ended) {
+          Log.i(TAG, "/link-control stream ended by VM; reconnecting")
+          activeWebSocket?.close(1000, "control stream ended")
         }
       }
       subscribeStreamId -> {
@@ -466,19 +586,31 @@ class MuseLinkClient(
     }
   }
 
-  private fun handleControl(m: JSONObject) {
+  /** Processes one control message. Returns `false` if the session is being closed and trailing messages should stop. */
+  private fun handleControl(m: JSONObject): Boolean {
     val method = m.optString("method")
     when {
-      m.optString("id") == registerId && method.isEmpty() -> {
+      m.optString("id") == registerId && registerId.isNotEmpty() && method.isEmpty() -> {
         val err = m.opt("error")
-        if (err != null && err != JSONObject.NULL && err != false) Log.e(TAG, "link.register rejected: $err")
-        else Log.i(TAG, "Registered with Muse (reply keys: ${m.keys().asSequence().toList()}, result: ${m.optJSONObject("result")?.keys()?.asSequence()?.toList()})")
+        val hasError = err != null && err != JSONObject.NULL && err != false && (err !is String || err.isNotEmpty())
+        val rejected = hasError || m.opt("ok") == false
+        if (rejected) {
+          Log.e(TAG, "link.register rejected: ${if (hasError) err else "ok=false"}")
+          activeWebSocket?.close(1000, "link.register rejected")
+          return false
+        } else {
+          Log.i(TAG, "Registered with Muse (reply keys: ${m.keys().asSequence().toList()}, result: ${m.optJSONObject("result")?.keys()?.asSequence()?.toList()})")
+        }
       }
-      m.optString("event") in setOf("link.unpaired", "node.unpaired") ->
+      m.optString("event") in setOf("link.unpaired", "node.unpaired") -> {
         Log.w(TAG, "Muse removed this device (${m.optString("event")})")
+        activeWebSocket?.close(1000, "unpaired")
+        return false
+      }
       method == "link.invoke" && m.optString("id").isNotEmpty() ->
         runInvoke(m.optString("id"), m.optString("command"), m.optJSONObject("params"))
     }
+    return true
   }
 
   /** A command from a turn started by this device arrives on the chat stream instead (hey-muse). */
@@ -489,14 +621,29 @@ class MuseLinkClient(
   }
 
   private fun runInvoke(id: String, command: String, params: JSONObject?) {
-    scope.launch {
+    val originWs = activeWebSocket ?: return
+    scope.launch(Dispatchers.IO) {
       Log.i(TAG, "invoke $command")
-      val result = withContext(Dispatchers.IO) { PortalCommands.invoke(command, params) }
-      val ws = activeWebSocket ?: return@launch
+      val result = PortalCommands.invoke(command, params)
       val msg = JSONObject().put("method", "link.result").put("id", id)
       result.keys().forEach { k -> msg.put(k, result.get(k)) }
-      sendControl(ws, msg)
-      Log.i(TAG, "$command -> ${if (result.optBoolean("ok")) "ok" else result.optString("error")}")
+      when (sendControl(originWs, msg)) {
+        ControlSendResult.SENT ->
+          Log.i(TAG, "$command -> ${if (result.optBoolean("ok")) "ok" else result.optString("error")}")
+        ControlSendResult.TOO_LARGE -> {
+          val fallback = JSONObject()
+            .put("method", "link.result")
+            .put("id", id)
+            .put("ok", false)
+            .put("error", "command result exceeded control message budget")
+          sendControl(originWs, fallback)
+          Log.w(TAG, "$command -> failed (exceeded control message budget)")
+        }
+        ControlSendResult.NOT_CONNECTED ->
+          Log.w(TAG, "$command -> dropped (session disconnected)")
+        ControlSendResult.FAILED ->
+          Log.w(TAG, "$command -> failed (transport error)")
+      }
     }
   }
 

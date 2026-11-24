@@ -195,6 +195,17 @@ data class ApplicationResponse(
   val body: ByteArray = ByteArray(0),
   val endBody: Boolean = false,
 ) {
+  fun encode(): ByteArray {
+    val baos = ByteArrayOutputStream()
+    if (status != 0) baos.write(ProtoWire.uint32Field(1, status))
+    for (h in headers) {
+      baos.write(ProtoWire.delimitedField(2, h.encode()))
+    }
+    if (body.isNotEmpty()) baos.write(ProtoWire.bytesField(3, body))
+    if (endBody) baos.write(ProtoWire.boolField(4, true))
+    return baos.toByteArray()
+  }
+
   companion object {
     fun decode(data: ByteArray): ApplicationResponse {
       var status = 0
@@ -274,7 +285,39 @@ sealed class ServiceFramePayload {
   data class Req(val request: ApplicationRequest) : ServiceFramePayload()
   data class Resp(val response: ApplicationResponse) : ServiceFramePayload()
   data class Chunk(val chunk: BodyChunk) : ServiceFramePayload()
-  data class Reset(val code: Int, val reason: String) : ServiceFramePayload()
+  data class Reset(val code: Int, val reason: String) : ServiceFramePayload() {
+    fun encode(): ByteArray {
+      val baos = ByteArrayOutputStream()
+      if (code != 0) baos.write(ProtoWire.uint32Field(1, code))
+      if (reason.isNotEmpty()) baos.write(ProtoWire.stringField(2, reason))
+      return baos.toByteArray()
+    }
+
+    companion object {
+      fun decode(data: ByteArray): Reset {
+        var code = 0
+        var reason = ""
+        var offset = 0
+        while (offset < data.size) {
+          val (fNum, wType, nextOffset) = ProtoWire.readKey(data, offset)
+          when (fNum) {
+            1 -> {
+              val (raw, off) = ProtoWire.readVarint(data, nextOffset)
+              code = raw.toInt()
+              offset = off
+            }
+            2 -> {
+              val (b, off) = ProtoWire.readDelimited(data, nextOffset)
+              reason = String(b, Charsets.UTF_8)
+              offset = off
+            }
+            else -> offset = ProtoWire.skipField(data, nextOffset, wType)
+          }
+        }
+        return Reset(code, reason)
+      }
+    }
+  }
 }
 
 data class ServiceFrame(
@@ -286,8 +329,10 @@ data class ServiceFrame(
     if (streamId != 0L) baos.write(ProtoWire.int64Field(1, streamId))
     when (payload) {
       is ServiceFramePayload.Req -> baos.write(ProtoWire.delimitedField(2, payload.request.encode()))
+      is ServiceFramePayload.Resp -> baos.write(ProtoWire.delimitedField(3, payload.response.encode()))
       is ServiceFramePayload.Chunk -> baos.write(ProtoWire.delimitedField(4, payload.chunk.encode()))
-      else -> {}
+      is ServiceFramePayload.Reset -> baos.write(ProtoWire.delimitedField(5, payload.encode()))
+      null -> {}
     }
     return baos.toByteArray()
   }
@@ -306,8 +351,8 @@ data class ServiceFrame(
             offset = off
           }
           2 -> {
-            val (raw, off) = ProtoWire.readDelimited(data, nextOffset)
-            // ApplicationRequest
+            val (_, off) = ProtoWire.readDelimited(data, nextOffset)
+            // ApplicationRequest is client-to-server only; skip if present on inbound frames.
             offset = off
           }
           3 -> {
@@ -322,7 +367,7 @@ data class ServiceFrame(
           }
           5 -> {
             val (raw, off) = ProtoWire.readDelimited(data, nextOffset)
-            payload = ServiceFramePayload.Reset(0, "Reset")
+            payload = ServiceFramePayload.Reset.decode(raw)
             offset = off
           }
           else -> offset = ProtoWire.skipField(data, nextOffset, wType)
@@ -374,11 +419,17 @@ data class NoiseTransportFrame(
           }
           2 -> {
             val (raw, off) = ProtoWire.readVarint(data, nextOffset)
+            if (raw < 0L || raw > Int.MAX_VALUE.toLong()) {
+              throw NoiseProtocolException("chunkIndex out of int32 range: $raw")
+            }
             chunkIndex = raw.toInt()
             offset = off
           }
           3 -> {
             val (raw, off) = ProtoWire.readVarint(data, nextOffset)
+            if (raw < 0L || raw > Int.MAX_VALUE.toLong()) {
+              throw NoiseProtocolException("totalChunks out of int32 range: $raw")
+            }
             totalChunks = raw.toInt()
             offset = off
           }
@@ -395,13 +446,118 @@ data class NoiseTransportFrame(
   }
 }
 
+/**
+ * Reassembles multi-chunk `NoiseTransportFrame` payloads by `chunkId`.
+ * Port of `musegadget.noise.framing.NoiseFrameDecoder`.
+ */
+class NoiseFrameDecoder(
+  private val clockMs: () -> Long = { System.nanoTime() / 1_000_000L },
+) {
+  companion object {
+    const val MAX_CHUNK_PAYLOAD = 65489
+    const val MAX_PENDING_ASSEMBLIES = 16
+    const val MAX_TOTAL_CHUNKS = 256
+    const val MAX_ASSEMBLY_BYTES = 16 * 1024 * 1024
+    const val ASSEMBLY_TTL_MS = 60_000L
+  }
+
+  private class Assembly(
+    val total: Int,
+    val createdAtMs: Long,
+    var totalBytes: Int = 0,
+    val chunks: MutableMap<Int, ByteArray> = HashMap(),
+  )
+
+  private val pending = LinkedHashMap<Long, Assembly>()
+  private var poisoned = false
+
+  fun decode(frameBytes: ByteArray): ByteArray? {
+    if (poisoned) throw NoiseProtocolException("NoiseFrameDecoder: poisoned after prior failure")
+    return try {
+      val frame = NoiseTransportFrame.decode(frameBytes)
+      if (frame.totalChunks < 1 || frame.totalChunks > MAX_TOTAL_CHUNKS) {
+        throw NoiseProtocolException("invalid totalChunks: ${frame.totalChunks}")
+      }
+      if (frame.chunkIndex < 0 || frame.chunkIndex >= frame.totalChunks) {
+        throw NoiseProtocolException("chunkIndex ${frame.chunkIndex} out of range [0, ${frame.totalChunks})")
+      }
+      if (frame.payload.size > MAX_CHUNK_PAYLOAD) {
+        throw NoiseProtocolException("payload too large for noise frame (${frame.payload.size} bytes)")
+      }
+
+      evictExpired()
+
+      if (frame.totalChunks == 1 && !pending.containsKey(frame.chunkId)) {
+        return frame.payload
+      }
+
+      val existing = pending[frame.chunkId]
+      val assembly = if (existing == null) {
+        if (pending.size >= MAX_PENDING_ASSEMBLIES) {
+          throw NoiseProtocolException("too many pending noise frame assemblies")
+        }
+        Assembly(total = frame.totalChunks, createdAtMs = clockMs()).also { pending[frame.chunkId] = it }
+      } else {
+        existing
+      }
+
+      if (assembly.total != frame.totalChunks) {
+        pending.remove(frame.chunkId)
+        throw NoiseProtocolException(
+          "inconsistent totalChunks for chunkId: expected ${assembly.total}, got ${frame.totalChunks}"
+        )
+      }
+      if (assembly.chunks.containsKey(frame.chunkIndex)) {
+        pending.remove(frame.chunkId)
+        throw NoiseProtocolException("duplicate chunkIndex ${frame.chunkIndex}")
+      }
+
+      assembly.totalBytes += frame.payload.size
+      if (assembly.totalBytes > MAX_ASSEMBLY_BYTES) {
+        pending.remove(frame.chunkId)
+        throw NoiseProtocolException("assembly exceeded byte budget")
+      }
+
+      assembly.chunks[frame.chunkIndex] = frame.payload
+      if (assembly.chunks.size < assembly.total) {
+        return null
+      }
+
+      pending.remove(frame.chunkId)
+      val out = ByteArray(assembly.totalBytes)
+      var offset = 0
+      for (i in 0 until assembly.total) {
+        val part = assembly.chunks[i] ?: throw NoiseProtocolException("missing chunk $i")
+        System.arraycopy(part, 0, out, offset, part.size)
+        offset += part.size
+      }
+      out
+    } catch (e: Exception) {
+      poisoned = true
+      pending.clear()
+      throw if (e is NoiseProtocolException) e else NoiseProtocolException(e.message ?: "noise frame decode failed", e)
+    }
+  }
+
+  private fun evictExpired() {
+    val now = clockMs()
+    val it = pending.entries.iterator()
+    while (it.hasNext()) {
+      if (now - it.next().value.createdAtMs > ASSEMBLY_TTL_MS) {
+        it.remove()
+      }
+    }
+  }
+}
+
 class NoiseTransport(
   private val sendCipher: CipherState,
   private val recvCipher: CipherState,
+  private val frameDecoder: NoiseFrameDecoder = NoiseFrameDecoder(),
 ) {
   companion object {
     private val EMPTY_AD = ByteArray(0)
-    private const val MAX_CHUNK_PAYLOAD = 65489
+    private const val MAX_CHUNK_PAYLOAD = NoiseFrameDecoder.MAX_CHUNK_PAYLOAD
     private val SECURE_RANDOM = SecureRandom()
 
     fun encodeLengthPrefixedMessage(jsonBytes: ByteArray): ByteArray {
@@ -423,6 +579,7 @@ class NoiseTransport(
   }
 
   private val nextStreamId = AtomicLong(1)
+  private val recvLock = Any()
 
   fun startStreamRequest(
     method: String,
@@ -452,7 +609,11 @@ class NoiseTransport(
 
   private fun encodeFrames(data: ByteArray): List<ByteArray> {
     val chunkId = SECURE_RANDOM.nextLong()
-    val totalChunks = maxOf(1, (data.size + MAX_CHUNK_PAYLOAD - 1) / MAX_CHUNK_PAYLOAD)
+    val totalChunksLong = maxOf(1L, (data.size.toLong() + MAX_CHUNK_PAYLOAD - 1L) / MAX_CHUNK_PAYLOAD)
+    if (totalChunksLong > NoiseFrameDecoder.MAX_TOTAL_CHUNKS.toLong()) {
+      throw NoiseProtocolException("payload too large for noise framing (${data.size} bytes, $totalChunksLong chunks)")
+    }
+    val totalChunks = totalChunksLong.toInt()
     val result = mutableListOf<ByteArray>()
 
     for (index in 0 until totalChunks) {
@@ -467,11 +628,11 @@ class NoiseTransport(
     return result
   }
 
-  fun decryptFrame(ciphertext: ByteArray): ServiceFrame? {
+  fun decryptFrame(ciphertext: ByteArray): ServiceFrame? = synchronized(recvLock) {
     val plaintext = recvCipher.decryptWithAd(EMPTY_AD, ciphertext)
-    val transportFrame = NoiseTransportFrame.decode(plaintext)
-    val serviceResponse = parseServiceResponse(transportFrame.payload)
-    return ServiceFrame.decode(serviceResponse)
+    val reassembled = frameDecoder.decode(plaintext) ?: return null
+    val serviceResponse = parseServiceResponse(reassembled)
+    ServiceFrame.decode(serviceResponse)
   }
 
   private fun parseServiceResponse(data: ByteArray): ByteArray {

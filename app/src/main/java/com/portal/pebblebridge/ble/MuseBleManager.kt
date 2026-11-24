@@ -120,7 +120,8 @@ class ChunkAssembler(private val maxBytes: Int = MuseBleManager.MAX_MESSAGE_BYTE
 
 class MuseBleManager(
   private val context: Context,
-  private val coroutineDispatcher: CoroutineDispatcher = Dispatchers.Default
+  private val coroutineDispatcher: CoroutineDispatcher = Dispatchers.Default,
+  private val useGadgetNodeId: Boolean = false,
 ) {
 
   companion object {
@@ -200,7 +201,10 @@ class MuseBleManager(
   val deviceMac: String
   val deviceSuffix: String
   val bleName: String
+  val legacyNodeId: String
+  val setupNodeId: String
   val nodeId: String
+    get() = BridgeRepository.resolveNodeId(setupNodeId, legacyNodeId)
   val deviceId: String
 
   init {
@@ -226,7 +230,8 @@ class MuseBleManager(
     deviceMac = String.format("%02x:%02x:%02x:%02x:%02x:%02x", b0, b1, b2, b3, b4, b5)
     deviceSuffix = String.format("%02x%02x%02x", b3, b4, b5)
     bleName = "MuseGadget" + deviceSuffix.uppercase()
-    nodeId = "homelink-$deviceSuffix"
+    legacyNodeId = "homelink-$deviceSuffix"
+    setupNodeId = (if (useGadgetNodeId) "gadget-" else "homelink-") + deviceSuffix
     deviceId = "hatch-link:$deviceMac"
     BridgeRepository.deviceId = deviceId
     BridgeRepository.setBleDeviceName(bleName)
@@ -374,6 +379,9 @@ class MuseBleManager(
     }
     isPaired = false
     BridgeRepository.setPaired(false)
+    if (BridgeRepository.config.value.museAccessToken.isBlank()) {
+      BridgeRepository.nodeId = setupNodeId
+    }
     resetPairing()
     for (dev in subscribedDevices) {
       try {
@@ -723,7 +731,7 @@ class MuseBleManager(
   private suspend fun sendDeviceInfo(device: BluetoothDevice) {
     val info = JSONObject().apply {
       put("type", "device_info")
-      put("node_id", nodeId)
+      put("node_id", setupNodeId)
       put("version", "1.0.0")
       put("device_id", deviceId)
       put("mac", deviceMac)
@@ -792,7 +800,7 @@ class MuseBleManager(
 
       val transcript = buildTranscript(
         deviceId = deviceId,
-        nodeId = nodeId,
+        nodeId = setupNodeId,
         mac = deviceMac,
         firmwareVersion = "1.0.0",
         mobilePub = mobilePubB64,
@@ -830,7 +838,7 @@ class MuseBleManager(
         put("type", "pairing_ready")
         put("version", 5)
         put("device_id", deviceId)
-        put("node_id", nodeId)
+        put("node_id", setupNodeId)
         put("mac", deviceMac)
         put("model", "hatch_link")
         put("firmware_version", "1.0.0")
@@ -991,19 +999,27 @@ class MuseBleManager(
           val apiUrlV2 = creds.optString("api_url_v2")
           val noiseHost = creds.optString("noise_host")
 
-          Log.i(TAG, "Received Provisioning Credentials: apiUrl=$apiUrlV2 noiseHost=$noiseHost accessToken=${accessToken.take(8)}...")
+          Log.i(
+            TAG,
+            "Received Provisioning Credentials: apiUrl=$apiUrlV2 noiseHost=$noiseHost hasAccessToken=${accessToken.isNotBlank()} hasRefreshToken=${refreshToken.isNotBlank()}"
+          )
 
-          if (accessToken.isNotBlank()) {
-            BridgeRepository.updateConfig(
-              BridgeRepository.config.value.copy(
-                museAccessToken = accessToken,
-                museRefreshToken = refreshToken,
-                museApiUrl = apiUrlV2.ifBlank { apiUrl.ifBlank { "https://api.muse.ai" } },
-                museNoiseHost = noiseHost,
-              )
-            )
-            com.portal.pebblebridge.muse.MuseLinkClient.activeInstance?.triggerReconnect()
+          if (accessToken.isBlank()) {
+            Log.w(TAG, "provision_v2 missing access_token; rejecting provisioning")
+            sendEncryptedStatus(device, "error_auth_failed")
+            return
           }
+
+          // Store the offered node_id together with the tokens before marking paired (upstream #414).
+          BridgeRepository.setPairedNodeId(setupNodeId)
+          BridgeRepository.updateConfig(
+            BridgeRepository.config.value.copy(
+              museAccessToken = accessToken,
+              museRefreshToken = refreshToken,
+              museApiUrl = apiUrlV2.ifBlank { apiUrl.ifBlank { "https://api.muse.ai" } },
+              museNoiseHost = noiseHost,
+            )
+          )
 
           synchronized(pairingLock) {
             pairingWatchdogJob?.cancel()
@@ -1012,6 +1028,10 @@ class MuseBleManager(
 
           isPaired = true
           BridgeRepository.setPaired(true)
+          com.portal.pebblebridge.muse.MuseLinkClient.activeInstance?.let { client ->
+            client.reconnect()
+            client.triggerReconnect()
+          }
 
           sendEncryptedStatus(device, "wifi_connecting")
           delay(150)

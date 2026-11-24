@@ -216,9 +216,13 @@ object PortalCommands {
 
   private val byName = all.associateBy { it.name }
 
-  /** `commands_v2` for link.register, or empty when the user turned commands off. */
+  /**
+   * `commands_v2` for `link.register`. `device.guide` is always included as read-only device
+   * metadata (per `protocols/DEVICE.md`); `portal.*` action commands are included when [enabled].
+   */
   fun registerSpec(enabled: Boolean = HomePrefs.settings.value.museCommands): JSONObject {
     val spec = JSONObject()
+    spec.put(DeviceGuide.COMMAND, DeviceGuide.spec())
     if (!enabled) return spec
     for (c in all) {
       fun params(list: List<CommandParam>) = JSONObject().apply {
@@ -236,6 +240,9 @@ object PortalCommands {
   /** Runs a command and builds the link.result fields: ok + payload, or ok=false + error. */
   fun invoke(name: String, params: JSONObject?): JSONObject {
     val result = JSONObject()
+    if (name == DeviceGuide.COMMAND) {
+      return result.put("ok", true).put("payload", DeviceGuide.payload())
+    }
     val command = byName[name]
     if (command == null || !HomePrefs.settings.value.museCommands) {
       return result.put("ok", false).put("error", "unsupported command: $name")

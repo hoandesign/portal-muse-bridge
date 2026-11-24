@@ -24,7 +24,10 @@ object BridgeRepository {
   private const val KEY_MUSE_NOISE_HOST = "pref_muse_noise_host"
   private const val KEY_MUSE_SESSION = "pref_muse_session"
   private const val KEY_MUSE_API_URL = "pref_muse_api_url"
+  private const val KEY_PAIRED_NODE_ID = "pref_paired_node_id"
   private const val LEGACY_KEY_MUSE_TOKEN = "pref_muse_token"
+
+  val NODE_ID_REGEX = Regex("^[a-z]+-[0-9a-f]{6}$")
 
   private var sharedPreferences: SharedPreferences? = null
 
@@ -79,6 +82,11 @@ object BridgeRepository {
   @Volatile
   var nodeId: String = "homelink-e1890c"
 
+  /** Node ID stored with the active pairing (upstream #414); empty if unpaired or pre-414 pairing. */
+  @Volatile
+  var pairedNodeId: String = ""
+    private set
+
   private val _museLinkState = MutableStateFlow(com.portal.pebblebridge.model.LinkState.DISCONNECTED)
   val museLinkState: StateFlow<com.portal.pebblebridge.model.LinkState> = _museLinkState.asStateFlow()
 
@@ -94,6 +102,7 @@ object BridgeRepository {
     _bleDeviceName.value = "MuseGadget"
     _museLinkState.value = com.portal.pebblebridge.model.LinkState.DISCONNECTED
     nodeId = "homelink-e1890c"
+    pairedNodeId = ""
   }
 
   fun initPersistence(context: Context) {
@@ -142,7 +151,13 @@ object BridgeRepository {
       museApiUrl = savedMuseApiUrl,
       museNoiseHost = savedNoiseHost,
     )
-    _isPaired.value = prefs.getBoolean("pref_is_paired", false)
+    val paired = prefs.getBoolean("pref_is_paired", false)
+    _isPaired.value = paired
+    val storedNodeId = prefs.getString(KEY_PAIRED_NODE_ID, "")?.trim().orEmpty()
+    pairedNodeId = if (paired && NODE_ID_REGEX.matches(storedNodeId)) storedNodeId else ""
+    if (pairedNodeId.isNotBlank()) {
+      nodeId = pairedNodeId
+    }
   }
 
   fun addNote(note: VoiceNote) {
@@ -241,6 +256,32 @@ object BridgeRepository {
 
   fun setPaired(paired: Boolean) {
     _isPaired.value = paired
-    sharedPreferences?.edit()?.putBoolean("pref_is_paired", paired)?.apply()
+    val editor = sharedPreferences?.edit()?.putBoolean("pref_is_paired", paired)
+    if (!paired) {
+      pairedNodeId = ""
+      editor?.remove(KEY_PAIRED_NODE_ID)
+    }
+    editor?.apply()
+  }
+
+  /** Stores the node ID offered during pairing together with its tokens (upstream #414). */
+  fun setPairedNodeId(id: String) {
+    val trimmed = id.trim()
+    require(NODE_ID_REGEX.matches(trimmed)) { "invalid node_id: $trimmed" }
+    pairedNodeId = trimmed
+    nodeId = trimmed
+    sharedPreferences?.edit()?.putString(KEY_PAIRED_NODE_ID, trimmed)?.apply()
+  }
+
+  /**
+   * Resolves the active node ID per upstream #414:
+   * - Paired with a stored ID -> keep the stored ID (never rename).
+   * - Paired before IDs were stored -> keep [legacyNodeId] (`homelink-xxxxxx`).
+   * - Unpaired -> offer [setupNodeId].
+   */
+  fun resolveNodeId(setupNodeId: String, legacyNodeId: String): String = when {
+    _isPaired.value && pairedNodeId.isNotBlank() -> pairedNodeId
+    _isPaired.value -> legacyNodeId
+    else -> setupNodeId
   }
 }

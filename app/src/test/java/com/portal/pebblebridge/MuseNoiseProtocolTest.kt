@@ -300,4 +300,146 @@ class MuseNoiseProtocolTest {
     val serviceFrame = decTransport.decryptFrame(encrypted)
     assertNotNull(serviceFrame)
   }
+
+  @Test
+  fun testNoiseFrameDecoderReassemblesOutOfOrderMultiChunkAndEnforcesBounds() {
+    var now = 1_000L
+    val decoder = com.portal.pebblebridge.muse.NoiseFrameDecoder(clockMs = { now })
+
+    val part0 = "chunk-zero-".toByteArray(StandardCharsets.UTF_8)
+    val part1 = "chunk-one-".toByteArray(StandardCharsets.UTF_8)
+    val part2 = "chunk-two".toByteArray(StandardCharsets.UTF_8)
+
+    // Deliver chunks out of order [2, 0, 1]
+    assertNull(decoder.decode(NoiseTransportFrame(chunkId = 77L, chunkIndex = 2, totalChunks = 3, payload = part2).encode()))
+    assertNull(decoder.decode(NoiseTransportFrame(chunkId = 77L, chunkIndex = 0, totalChunks = 3, payload = part0).encode()))
+    val joined = decoder.decode(NoiseTransportFrame(chunkId = 77L, chunkIndex = 1, totalChunks = 3, payload = part1).encode())
+    assertNotNull(joined)
+    assertArrayEquals(part0 + part1 + part2, joined)
+
+    // Expired partial assembly is evicted after TTL
+    assertNull(decoder.decode(NoiseTransportFrame(chunkId = 88L, chunkIndex = 0, totalChunks = 2, payload = part0).encode()))
+    now += com.portal.pebblebridge.muse.NoiseFrameDecoder.ASSEMBLY_TTL_MS + 1L
+    // A fresh chunkId=88 single-chunk frame succeeds because stale assembly was evicted
+    val afterTtl = decoder.decode(NoiseTransportFrame(chunkId = 88L, chunkIndex = 0, totalChunks = 1, payload = part2).encode())
+    assertArrayEquals(part2, afterTtl)
+
+    // Duplicate chunk index fails and poisons decoder
+    val badDecoder = com.portal.pebblebridge.muse.NoiseFrameDecoder()
+    assertNull(badDecoder.decode(NoiseTransportFrame(chunkId = 99L, chunkIndex = 0, totalChunks = 2, payload = part0).encode()))
+    try {
+      badDecoder.decode(NoiseTransportFrame(chunkId = 99L, chunkIndex = 0, totalChunks = 2, payload = part0).encode())
+      fail("Duplicate chunkIndex must fail")
+    } catch (_: NoiseProtocolException) {
+      // Expected
+    }
+    try {
+      badDecoder.decode(NoiseTransportFrame(chunkId = 100L, chunkIndex = 0, totalChunks = 1, payload = part0).encode())
+      fail("Poisoned decoder must reject subsequent frames")
+    } catch (_: NoiseProtocolException) {
+      // Expected
+    }
+  }
+
+  @Test
+  fun testNoiseTransportMultiChunkPayloadRoundtrip() {
+    val key1 = ByteArray(32) { 0x33.toByte() }
+    val key2 = ByteArray(32) { 0x44.toByte() }
+    val encTransport = NoiseTransport(CipherState().apply { initializeKey(key1) }, CipherState().apply { initializeKey(key2) })
+    val decTransport = NoiseTransport(CipherState().apply { initializeKey(key2) }, CipherState().apply { initializeKey(key1) })
+
+    // > MAX_CHUNK_PAYLOAD (65489) forces multi-chunk NoiseTransportFrame splitting
+    val bigPayload = ByteArray(140_000) { (it % 251).toByte() }
+    val frames = encTransport.encryptBodyChunk(streamId = 9L, data = bigPayload, endBody = true)
+    assertTrue("Large payload must split into >= 3 Noise frames", frames.size >= 3)
+
+    var decoded: ServiceFrame? = null
+    for ((i, f) in frames.withIndex()) {
+      val res = decTransport.decryptFrame(f)
+      if (i < frames.lastIndex) {
+        assertNull("Intermediate Noise chunk $i must return null", res)
+      } else {
+        decoded = res
+      }
+    }
+    assertNotNull(decoded)
+    assertEquals(9L, decoded!!.streamId)
+    val chunk = (decoded.payload as ServiceFramePayload.Chunk).chunk
+    assertArrayEquals(bigPayload, chunk.data)
+    assertTrue(chunk.endBody)
+  }
+
+  @Test
+  fun testServiceFrameResetRoundtripPreservesCodeAndReason() {
+    val frame = ServiceFrame(streamId = 5L, payload = ServiceFramePayload.Reset(code = 2, reason = "stream cancelled"))
+    val decoded = ServiceFrame.decode(frame.encode())
+    assertEquals(5L, decoded.streamId)
+    val reset = decoded.payload as ServiceFramePayload.Reset
+    assertEquals(2, reset.code)
+    assertEquals("stream cancelled", reset.reason)
+  }
+
+  @Test
+  fun testNoiseFrameDecoderRejectsInvalidBoundsCollisionsAndVarintTruncation() {
+    val part = "abc".toByteArray(StandardCharsets.UTF_8)
+
+    // 1. Single-chunk (totalChunks=1) colliding with an active multi-chunk assembly for same chunkId
+    val d1 = com.portal.pebblebridge.muse.NoiseFrameDecoder()
+    assertNull(d1.decode(NoiseTransportFrame(chunkId = 10L, chunkIndex = 0, totalChunks = 2, payload = part).encode()))
+    try {
+      d1.decode(NoiseTransportFrame(chunkId = 10L, chunkIndex = 0, totalChunks = 1, payload = part).encode())
+      fail("Single-chunk frame colliding with active multi-chunk assembly must fail")
+    } catch (_: NoiseProtocolException) {
+      // Expected
+    }
+
+    // 2. Inconsistent totalChunks for same chunkId
+    val d2 = com.portal.pebblebridge.muse.NoiseFrameDecoder()
+    assertNull(d2.decode(NoiseTransportFrame(chunkId = 11L, chunkIndex = 0, totalChunks = 2, payload = part).encode()))
+    try {
+      d2.decode(NoiseTransportFrame(chunkId = 11L, chunkIndex = 1, totalChunks = 3, payload = part).encode())
+      fail("Inconsistent totalChunks must fail")
+    } catch (_: NoiseProtocolException) {
+      // Expected
+    }
+
+    // 3. Invalid totalChunks (explicit wire 0 and 257), out-of-range chunkIndex, oversized chunk payload
+    val explicitZeroTotalChunks = ProtoWire.int64Field(1, 1L) + ProtoWire.uint32Field(3, 0) + ProtoWire.bytesField(4, part)
+    val badFrameBytes = listOf(
+      explicitZeroTotalChunks,
+      NoiseTransportFrame(chunkId = 1L, chunkIndex = 0, totalChunks = 257, payload = part).encode(),
+      NoiseTransportFrame(chunkId = 1L, chunkIndex = 2, totalChunks = 2, payload = part).encode(),
+      NoiseTransportFrame(chunkId = 1L, chunkIndex = 0, totalChunks = 1, payload = ByteArray(com.portal.pebblebridge.muse.NoiseFrameDecoder.MAX_CHUNK_PAYLOAD + 1)).encode(),
+    )
+    for ((idx, bf) in badFrameBytes.withIndex()) {
+      val dec = com.portal.pebblebridge.muse.NoiseFrameDecoder()
+      try {
+        dec.decode(bf)
+        fail("Expected NoiseProtocolException for invalid frame #$idx")
+      } catch (_: NoiseProtocolException) {
+        // Expected
+      }
+    }
+
+    // 4. MAX_PENDING_ASSEMBLIES limit enforced
+    val dMax = com.portal.pebblebridge.muse.NoiseFrameDecoder(clockMs = { 1_000L })
+    for (id in 1L..com.portal.pebblebridge.muse.NoiseFrameDecoder.MAX_PENDING_ASSEMBLIES.toLong()) {
+      assertNull(dMax.decode(NoiseTransportFrame(chunkId = id, chunkIndex = 0, totalChunks = 2, payload = part).encode()))
+    }
+    try {
+      dMax.decode(NoiseTransportFrame(chunkId = 999L, chunkIndex = 0, totalChunks = 2, payload = part).encode())
+      fail("Exceeding MAX_PENDING_ASSEMBLIES must fail")
+    } catch (_: NoiseProtocolException) {
+      // Expected
+    }
+
+    // 5. 64-bit varint truncation in NoiseTransportFrame.decode must be rejected
+    val truncatedTotalChunks = ProtoWire.int64Field(1, 5L) + ProtoWire.int64Field(3, 0x1_0000_0001L)
+    try {
+      NoiseTransportFrame.decode(truncatedTotalChunks)
+      fail("64-bit totalChunks varint exceeding Int.MAX_VALUE must be rejected")
+    } catch (_: NoiseProtocolException) {
+      // Expected
+    }
+  }
 }
