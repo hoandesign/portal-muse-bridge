@@ -1028,6 +1028,7 @@ class MuseBleManager(
 
           isPaired = true
           BridgeRepository.setPaired(true)
+          com.portal.pebblebridge.muse.RefreshGate.reset()
           com.portal.pebblebridge.muse.MuseLinkClient.activeInstance?.let { client ->
             client.reconnect()
             client.triggerReconnect()

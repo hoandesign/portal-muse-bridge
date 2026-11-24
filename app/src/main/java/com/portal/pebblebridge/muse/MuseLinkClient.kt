@@ -72,6 +72,8 @@ class MuseLinkClient(
   private var loopJob: Job? = null
   private val isRunning = AtomicBoolean(false)
   private val reconnectTrigger = Channel<Unit>(Channel.CONFLATED)
+  /** Whether the last fetch_vms ended with the device token rejected (401/403). */
+  @Volatile private var lastFetchUnauthorized = false
 
   @Volatile
   private var noiseTransport: NoiseTransport? = null
@@ -209,9 +211,12 @@ class MuseLinkClient(
         Log.i(TAG, "Fetching VMs from Meta cloud (token length=${token.length})")
         val vm = fetchVm(config)
         if (vm == null) {
-          Log.w(TAG, "No active VM found; retrying in ${backoffMs / 1000}s")
+          // A rejected token only changes once a refresh can go out (or the device is re-paired,
+          // which fires reconnectTrigger), so polling fetch_vms sooner just burns rate limit.
+          val waitMs = if (lastFetchUnauthorized) maxOf(backoffMs, RefreshGate.remainingMs()) else backoffMs
+          Log.w(TAG, "No active VM found; retrying in ${waitMs / 1000}s")
           setLinkState(LinkState.ERROR)
-          withTimeoutOrNull(backoffMs) {
+          withTimeoutOrNull(waitMs) {
             reconnectTrigger.receive()
           }
           backoffMs = minOf(backoffMs * 2, 30_000L)
@@ -262,9 +267,10 @@ class MuseLinkClient(
 
     try {
       sharedClient.newCall(req).execute().use { resp ->
+        lastFetchUnauthorized = resp.code == 401 || resp.code == 403
         if (resp.code == 401 && allowRefreshRetry && config.museRefreshToken.isNotBlank()) {
           Log.i(TAG, "fetch_vms returned 401; attempting token refresh with refresh_token...")
-          val refreshed = MuseDeliveryClient().refreshAccessToken(config, BridgeRepository.deviceId)
+          val refreshed = MuseDeliveryClient().refreshAccessToken(config, BridgeRepository.nodeId)
           if (refreshed.isSuccess) {
             val updatedConfig = BridgeRepository.config.value
             return@withContext fetchVm(updatedConfig, allowRefreshRetry = false)
@@ -294,6 +300,7 @@ class MuseLinkClient(
         vms.firstOrNull { it.isDefault } ?: vms.firstOrNull()
       }
     } catch (e: Exception) {
+      lastFetchUnauthorized = false
       Log.e(TAG, "Error executing fetch_vms", e)
       null
     }
