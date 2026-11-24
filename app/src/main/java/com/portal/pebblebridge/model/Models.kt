@@ -43,6 +43,8 @@ data class BridgeConfig(
   val museSessionId: String = "",
   val museApiUrl: String = "https://api.muse.ai",
   val museNoiseHost: String = "",
+  val zaloBotToken: String = "",
+  val zaloAllowedChatIds: String = "",
 ) {
   // Backward compatibility property for delivery client and UI: returns effective token
   val museSdkToken: String
@@ -51,6 +53,21 @@ data class BridgeConfig(
   val effectiveMuseToken: String
     get() = museAccessToken.ifBlank { developerSdkToken }
 }
+
+enum class ZaloBotState {
+  DISABLED,
+  CONNECTING,
+  POLLING,
+  ERROR,
+}
+
+data class ZaloBotStatus(
+  val state: ZaloBotState = ZaloBotState.DISABLED,
+  val botName: String = "",
+  val lastChatId: String = "",
+  val lastError: String? = null,
+  val messagesBridged: Int = 0,
+)
 
 data class ServerStatus(
   val isRunning: Boolean = false,

@@ -53,6 +53,7 @@ class BridgeService : Service() {
   private var mcpServer: McpHttpServer? = null
   private var bleManager: com.portal.pebblebridge.ble.MuseBleManager? = null
   private var museLinkClient: com.portal.pebblebridge.muse.MuseLinkClient? = null
+  private var zaloBotClient: com.portal.pebblebridge.zalo.ZaloBotClient? = null
   private var connectivityManager: ConnectivityManager? = null
   private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
@@ -99,6 +100,9 @@ class BridgeService : Service() {
     museLinkClient = com.portal.pebblebridge.muse.MuseLinkClient(serviceScope)
     museLinkClient?.start()
 
+    zaloBotClient = com.portal.pebblebridge.zalo.ZaloBotClient(serviceScope)
+    zaloBotClient?.start()
+
     registerNetworkCallback()
     // Timers and alarms set by Muse ring here, whatever screen is showing.
     serviceScope.launch {
@@ -139,6 +143,8 @@ class BridgeService : Service() {
 
   override fun onDestroy() {
     unregisterNetworkCallback()
+    zaloBotClient?.stop()
+    zaloBotClient = null
     museLinkClient?.stop()
     museLinkClient = null
     bleManager?.stop()
