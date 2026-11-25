@@ -13,20 +13,26 @@ import java.net.SocketTimeoutException
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -39,6 +45,11 @@ data class ZaloIncomingMessage(
   val isBot: Boolean = false,
   val eventName: String = "",
 )
+
+class ZaloApiException(
+  val code: Int,
+  message: String,
+) : IOException(message)
 
 /**
  * Long-polling Zalo Bot Platform client (`getUpdates` -> Meta Muse AI -> `sendMessage`).
@@ -86,6 +97,16 @@ class ZaloBotClient(
         }
       }
 
+    /** Android's `org.json.JSONObject.optString` returns `"null"` when the JSON value is `null`. */
+    internal fun JSONObject.optNonNullString(key: String): String =
+      if (isNull(key)) "" else optString(key, "")
+
+    internal fun isValidTokenFormat(token: String): Boolean =
+      token.isNotEmpty() && token.none { it.isWhitespace() || it.isISOControl() }
+
+    internal fun sanitize(message: String, token: String): String =
+      if (token.isNotBlank()) message.replace(token, "<redacted>") else message
+
     /**
      * Parses a Zalo Bot `getUpdates` JSON response into incoming text messages.
      * Supports both single-object `result` (current official API shape) and array `result`.
@@ -113,17 +134,17 @@ class ZaloBotClient(
 
       val out = mutableListOf<ZaloIncomingMessage>()
       for (item in items) {
-        val eventName = item.optString("event_name", "")
+        val eventName = item.optNonNullString("event_name")
         val msg = item.optJSONObject("message") ?: continue
-        val text = msg.optString("text", "").trim()
+        val text = msg.optNonNullString("text").trim()
         if (text.isBlank()) continue
         val from = msg.optJSONObject("from")
         val chat = msg.optJSONObject("chat")
         val isBot = from?.optBoolean("is_bot", false) ?: false
-        val senderId = from?.optString("id", "").orEmpty()
-        val senderName = from?.optString("display_name", "").orEmpty()
-        val chatId = chat?.optString("id", "").orEmpty().ifBlank { senderId }
-        val messageId = msg.optString("message_id", "")
+        val senderId = from?.optNonNullString("id").orEmpty()
+        val senderName = from?.optNonNullString("display_name").orEmpty()
+        val chatId = chat?.optNonNullString("id").orEmpty().ifBlank { senderId }
+        val messageId = msg.optNonNullString("message_id")
         if (chatId.isBlank() || isBot) continue
         out.add(
           ZaloIncomingMessage(
@@ -156,7 +177,7 @@ class ZaloBotClient(
 
     /**
      * Splits [text] into chunks of at most [maxLen] characters (Zalo sendMessage limit is 2000),
-     * preferring paragraph, newline, then word boundaries.
+     * preferring paragraph, newline, then word boundaries, and never splitting a UTF-16 surrogate pair.
      */
     fun chunkForZalo(text: String, maxLen: Int = MAX_ZALO_TEXT_LEN): List<String> {
       val trimmed = text.trim()
@@ -168,12 +189,15 @@ class ZaloBotClient(
       var remaining = trimmed
       while (remaining.length > maxLen) {
         val window = remaining.substring(0, maxLen)
-        val splitAt = listOf(
+        var splitAt = listOf(
           window.lastIndexOf("\n\n"),
           window.lastIndexOf('\n'),
           window.lastIndexOf(' '),
         ).firstOrNull { it >= maxLen / 3 } ?: maxLen
 
+        if (splitAt > 1 && Character.isHighSurrogate(remaining[splitAt - 1])) {
+          splitAt -= 1
+        }
         val piece = remaining.substring(0, splitAt).trimEnd()
         if (piece.isNotEmpty()) chunks.add(piece)
         remaining = remaining.substring(splitAt).trimStart()
@@ -184,31 +208,62 @@ class ZaloBotClient(
   }
 
   private val isRunning = AtomicBoolean(false)
+  private val lifecycleLock = Any()
+  private var clientSupervisor: Job? = null
   private var loopJob: Job? = null
+  private var activePollJob: Job? = null
   private val restartTrigger = Channel<Unit>(Channel.CONFLATED)
-  @Volatile private var activePollCall: Call? = null
   private val seenMessageIds = LinkedHashSet<String>()
 
+  private fun clientScope(): CoroutineScope {
+    val sup = synchronized(lifecycleLock) {
+      clientSupervisor ?: SupervisorJob(scope.coroutineContext[Job]).also { clientSupervisor = it }
+    }
+    return CoroutineScope(scope.coroutineContext + sup + ioDispatcher)
+  }
+
+  private fun updateStatusIfRunning(transform: (ZaloBotStatus) -> ZaloBotStatus) {
+    if (isRunning.get()) {
+      BridgeRepository.updateZaloBotStatus(transform)
+    }
+  }
+
   fun start() {
-    if (!isRunning.compareAndSet(false, true)) return
-    activeInstance = this
-    loopJob = scope.launch(ioDispatcher) { runLoop() }
+    synchronized(lifecycleLock) {
+      if (!isRunning.compareAndSet(false, true)) return
+      activeInstance = this
+      val sup = SupervisorJob(scope.coroutineContext[Job])
+      clientSupervisor = sup
+      loopJob = CoroutineScope(scope.coroutineContext + sup + ioDispatcher).launch { runLoop() }
+    }
   }
 
   fun stop() {
-    isRunning.set(false)
-    if (activeInstance === this) activeInstance = null
-    activePollCall?.cancel()
-    activePollCall = null
-    loopJob?.cancel()
-    loopJob = null
+    synchronized(lifecycleLock) {
+      isRunning.set(false)
+      if (activeInstance === this) activeInstance = null
+      activePollJob?.cancel()
+      activePollJob = null
+      loopJob?.cancel()
+      loopJob = null
+      clientSupervisor?.cancel()
+      clientSupervisor = null
+    }
     BridgeRepository.updateZaloBotStatus { ZaloBotStatus(state = ZaloBotState.DISABLED) }
   }
 
   /** Call after saving a new Zalo Bot token or allowed chat IDs in Settings. */
   fun triggerRestart() {
-    activePollCall?.cancel()
+    synchronized(lifecycleLock) {
+      activePollJob?.cancel()
+    }
     restartTrigger.trySend(Unit)
+  }
+
+  private fun drainRestartTrigger() {
+    while (restartTrigger.tryReceive().isSuccess) {
+      // Drain stale restart signals before entering a backoff wait.
+    }
   }
 
   private suspend fun runLoop() {
@@ -216,30 +271,49 @@ class ZaloBotClient(
     var backoffMs = 2_000L
 
     while (isRunning.get()) {
+      drainRestartTrigger()
       val config = BridgeRepository.config.value
       val token = config.zaloBotToken.trim()
       if (token.isBlank()) {
         initializedToken = ""
         backoffMs = 2_000L
-        BridgeRepository.updateZaloBotStatus {
+        updateStatusIfRunning {
           it.copy(state = ZaloBotState.DISABLED, botName = "", lastError = null)
         }
         withTimeoutOrNull(5_000L) { restartTrigger.receive() }
         continue
       }
 
+      if (!isValidTokenFormat(token)) {
+        initializedToken = ""
+        updateStatusIfRunning {
+          it.copy(state = ZaloBotState.ERROR, botName = "", lastError = "Invalid Bot Token format (remove spaces/newlines)")
+        }
+        withTimeoutOrNull(60_000L) { restartTrigger.receive() }
+        continue
+      }
+
       if (token != initializedToken) {
-        BridgeRepository.updateZaloBotStatus {
+        updateStatusIfRunning {
           it.copy(state = ZaloBotState.CONNECTING, lastError = null)
         }
-        val meResult = getMe(token)
+        val meResult = try {
+          getMe(token)
+        } catch (e: CancellationException) {
+          throw e
+        } catch (e: Exception) {
+          Result.failure(IOException(sanitize("getMe error: ${e.javaClass.simpleName}", token)))
+        }
+
         if (meResult.isFailure) {
-          val err = meResult.exceptionOrNull()?.message ?: "Failed to connect to Zalo Bot API"
+          val ex = meResult.exceptionOrNull()
+          val isUnauthorized = ex is ZaloApiException && ex.code == 401
+          val err = sanitize(ex?.message ?: "Failed to connect to Zalo Bot API", token)
           Log.w(TAG, "getMe failed: $err")
-          BridgeRepository.updateZaloBotStatus {
-            it.copy(state = ZaloBotState.ERROR, lastError = err)
+          updateStatusIfRunning {
+            it.copy(state = ZaloBotState.ERROR, lastError = if (isUnauthorized) "Invalid Bot Token (HTTP 401)" else err)
           }
-          val waitMs = if (err.contains("401")) 60_000L else backoffMs
+          val waitMs = if (isUnauthorized) 60_000L else backoffMs
           withTimeoutOrNull(waitMs) { restartTrigger.receive() }
           backoffMs = minOf(backoffMs * 2, 30_000L)
           continue
@@ -247,20 +321,52 @@ class ZaloBotClient(
 
         val botName = meResult.getOrDefault("Zalo Bot")
         // Zalo treats webhooks and getUpdates as mutually exclusive; clear any stale webhook.
-        deleteWebhook(token)
+        val delResult = try {
+          deleteWebhook(token)
+        } catch (e: CancellationException) {
+          throw e
+        } catch (e: Exception) {
+          Result.failure(e)
+        }
+        if (delResult.isFailure) {
+          Log.w(TAG, "deleteWebhook warning: ${sanitize(delResult.exceptionOrNull()?.message ?: "failed", token)}")
+        }
         initializedToken = token
         backoffMs = 2_000L
         Log.i(TAG, "Zalo Bot polling ready (bot=$botName)")
-        BridgeRepository.updateZaloBotStatus {
+        updateStatusIfRunning {
           it.copy(state = ZaloBotState.POLLING, botName = botName, lastError = null)
         }
       }
 
       try {
-        val pollResult = getUpdates(token, POLL_TIMEOUT_SECONDS)
+        var pollResult: Result<List<ZaloIncomingMessage>> = Result.success(emptyList())
+        val pollJob = clientScope().launch {
+          pollResult = getUpdates(token, POLL_TIMEOUT_SECONDS)
+        }
+        synchronized(lifecycleLock) {
+          if (!isRunning.get()) {
+            pollJob.cancel()
+            return
+          }
+          activePollJob = pollJob
+        }
+        try {
+          pollJob.join()
+        } finally {
+          synchronized(lifecycleLock) {
+            if (activePollJob === pollJob) activePollJob = null
+          }
+        }
+        if (!isRunning.get()) return
+        if (pollJob.isCancelled) {
+          // Triggered by triggerRestart() — immediately re-evaluate config without backoff.
+          continue
+        }
+
         if (pollResult.isSuccess) {
           backoffMs = 2_000L
-          BridgeRepository.updateZaloBotStatus {
+          updateStatusIfRunning {
             if (it.state != ZaloBotState.POLLING || it.lastError != null) {
               it.copy(state = ZaloBotState.POLLING, lastError = null)
             } else {
@@ -270,26 +376,41 @@ class ZaloBotClient(
           val messages = pollResult.getOrDefault(emptyList())
           for (msg in messages) {
             if (!markSeenIfNew(msg.messageId)) continue
-            scope.launch(ioDispatcher) {
+            clientScope().launch {
               handleIncomingMessage(token, msg)
             }
           }
         } else {
-          val err = pollResult.exceptionOrNull()?.message ?: "Polling error"
-          if (err.contains("401")) {
-            initializedToken = ""
-            Log.w(TAG, "getUpdates rejected (HTTP 401); check Zalo Bot token")
-            BridgeRepository.updateZaloBotStatus {
-              it.copy(state = ZaloBotState.ERROR, lastError = "Invalid Bot Token (HTTP 401)")
+          val ex = pollResult.exceptionOrNull()
+          val code = (ex as? ZaloApiException)?.code
+          val err = sanitize(ex?.message ?: "Polling error", token)
+          when (code) {
+            401 -> {
+              initializedToken = ""
+              Log.w(TAG, "getUpdates rejected (HTTP 401); check Zalo Bot token")
+              updateStatusIfRunning {
+                it.copy(state = ZaloBotState.ERROR, lastError = "Invalid Bot Token (HTTP 401)")
+              }
+              withTimeoutOrNull(60_000L) { restartTrigger.receive() }
             }
-            withTimeoutOrNull(60_000L) { restartTrigger.receive() }
-          } else {
-            Log.w(TAG, "getUpdates failed: $err; retrying in ${backoffMs / 1000}s")
-            BridgeRepository.updateZaloBotStatus {
-              it.copy(state = ZaloBotState.ERROR, lastError = err)
+            409 -> {
+              // Webhook conflict — reset so deleteWebhook is retried on next cycle.
+              initializedToken = ""
+              Log.w(TAG, "getUpdates conflict (409); retrying deleteWebhook in ${backoffMs / 1000}s")
+              updateStatusIfRunning {
+                it.copy(state = ZaloBotState.ERROR, lastError = err)
+              }
+              withTimeoutOrNull(backoffMs) { restartTrigger.receive() }
+              backoffMs = minOf(backoffMs * 2, 30_000L)
             }
-            withTimeoutOrNull(backoffMs) { restartTrigger.receive() }
-            backoffMs = minOf(backoffMs * 2, 30_000L)
+            else -> {
+              Log.w(TAG, "getUpdates failed: $err; retrying in ${backoffMs / 1000}s")
+              updateStatusIfRunning {
+                it.copy(state = ZaloBotState.ERROR, lastError = err)
+              }
+              withTimeoutOrNull(backoffMs) { restartTrigger.receive() }
+              backoffMs = minOf(backoffMs * 2, 30_000L)
+            }
           }
         }
       } catch (e: CancellationException) {
@@ -302,7 +423,7 @@ class ZaloBotClient(
     }
   }
 
-  private fun markSeenIfNew(messageId: String): Boolean {
+  internal fun markSeenIfNew(messageId: String): Boolean {
     if (messageId.isBlank()) return true
     synchronized(seenMessageIds) {
       if (!seenMessageIds.add(messageId)) return false
@@ -316,6 +437,9 @@ class ZaloBotClient(
       return true
     }
   }
+
+  private fun isTokenStillActive(token: String): Boolean =
+    BridgeRepository.config.value.zaloBotToken.trim() == token
 
   internal suspend fun handleIncomingMessage(token: String, msg: ZaloIncomingMessage) {
     val config = BridgeRepository.config.value
@@ -339,8 +463,12 @@ class ZaloBotClient(
     BridgeRepository.addNote(note)
     BridgeRepository.updateZaloBotStatus { it.copy(messagesBridged = it.messagesBridged + 1) }
 
-    // Best-effort typing indicator on Zalo while Muse thinks.
-    sendChatAction(token, msg.chatId, "typing")
+    // Best-effort typing indicator off the critical path so it never delays Muse delivery.
+    clientScope().launch {
+      withTimeoutOrNull(3_000L) {
+        sendChatAction(token, msg.chatId, "typing")
+      }
+    }
 
     val replied = AtomicBoolean(false)
     val sendResult = museSender(msg.text, config.museSessionId) { update ->
@@ -353,9 +481,11 @@ class ZaloBotClient(
       }
       if (update.done && replied.compareAndSet(false, true)) {
         val replyText = update.text.trim()
-        if (replyText.isNotBlank()) {
-          scope.launch(ioDispatcher) {
-            sendMessage(token, msg.chatId, replyText)
+        if (replyText.isNotBlank() && isTokenStillActive(token)) {
+          clientScope().launch {
+            if (isTokenStillActive(token)) {
+              sendMessage(token, msg.chatId, replyText)
+            }
           }
         }
       }
@@ -364,18 +494,51 @@ class ZaloBotClient(
     if (sendResult.isSuccess) {
       BridgeRepository.updateNoteStatus(noteId, NoteStatus.DELIVERED)
     } else {
-      val errMsg = sendResult.exceptionOrNull()?.message ?: "Unable to reach Meta Muse"
+      val errMsg = sanitize(sendResult.exceptionOrNull()?.message ?: "Unable to reach Meta Muse", token)
       BridgeRepository.updateNoteStatus(noteId, NoteStatus.FAILED, error = errMsg)
-      sendMessage(token, msg.chatId, "⚠️ Portal chưa gửi được sang Meta Muse: $errMsg")
+      if (isTokenStillActive(token)) {
+        sendMessage(token, msg.chatId, "⚠️ Portal chưa gửi được sang Meta Muse: $errMsg")
+      }
     }
+  }
+
+  private fun buildBotRequest(token: String, method: String, payload: JSONObject): Request {
+    if (!isValidTokenFormat(token)) {
+      throw ZaloApiException(400, "Invalid Bot Token format")
+    }
+    val url = apiBaseUrl.trimEnd('/').toHttpUrl().newBuilder()
+      .addPathSegment("bot$token")
+      .addPathSegment(method)
+      .build()
+    return Request.Builder()
+      .url(url)
+      .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+      .build()
+  }
+
+  private suspend fun Call.awaitResponse(): Response = suspendCancellableCoroutine { cont ->
+    cont.invokeOnCancellation { cancel() }
+    enqueue(object : Callback {
+      override fun onFailure(call: Call, e: IOException) {
+        if (cont.isActive) cont.resumeWith(Result.failure(e))
+      }
+
+      override fun onResponse(call: Call, response: Response) {
+        if (cont.isActive) {
+          cont.resume(response)
+        } else {
+          response.close()
+        }
+      }
+    })
   }
 
   suspend fun getMe(token: String): Result<String> = withContext(ioDispatcher) {
     postBotApi(token, "getMe", JSONObject()).map { root ->
       val result = root.optJSONObject("result")
-      result?.optString("display_name")?.takeIf { it.isNotBlank() }
-        ?: result?.optString("account_name")?.takeIf { it.isNotBlank() }
-        ?: result?.optString("name")?.takeIf { it.isNotBlank() }
+      result?.optNonNullString("display_name")?.takeIf { it.isNotBlank() }
+        ?: result?.optNonNullString("account_name")?.takeIf { it.isNotBlank() }
+        ?: result?.optNonNullString("name")?.takeIf { it.isNotBlank() }
         ?: "Zalo Bot"
     }
   }
@@ -386,46 +549,46 @@ class ZaloBotClient(
 
   suspend fun getUpdates(token: String, timeoutSeconds: Int = POLL_TIMEOUT_SECONDS): Result<List<ZaloIncomingMessage>> =
     withContext(ioDispatcher) {
-      val body = JSONObject().put("timeout", timeoutSeconds)
-      val url = "${apiBaseUrl.trimEnd('/')}/bot$token/getUpdates"
-      val req = Request.Builder()
-        .url(url)
-        .post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
-        .build()
+      val req = try {
+        buildBotRequest(token, "getUpdates", JSONObject().put("timeout", timeoutSeconds))
+      } catch (e: Exception) {
+        return@withContext Result.failure(ZaloApiException(400, sanitize(e.message ?: "Invalid request", token)))
+      }
 
       val call = httpClient.newCall(req)
-      activePollCall = call
       try {
-        call.execute().use { resp ->
+        call.awaitResponse().use { resp ->
           val respText = resp.body?.string().orEmpty()
           if (resp.code == 408) {
             // Normal long-polling timeout with no new messages.
             return@withContext Result.success(emptyList())
           }
           if (!resp.isSuccessful) {
-            return@withContext Result.failure(IOException("getUpdates HTTP ${resp.code}"))
+            return@withContext Result.failure(ZaloApiException(resp.code, "getUpdates HTTP ${resp.code}"))
           }
           val root = try {
             JSONObject(respText)
           } catch (_: Exception) {
-            return@withContext Result.success(emptyList())
+            return@withContext Result.failure(IOException("getUpdates invalid JSON response"))
           }
           if (!root.optBoolean("ok", false)) {
             val code = root.optInt("error_code", 0)
             if (code == 408) return@withContext Result.success(emptyList())
-            val desc = root.optString("description", "API error $code")
-            return@withContext Result.failure(IOException("getUpdates failed ($code): $desc"))
+            val desc = sanitize(root.optNonNullString("description").ifBlank { "API error $code" }, token)
+            return@withContext Result.failure(ZaloApiException(code, "getUpdates failed ($code): $desc"))
           }
           Result.success(parseUpdates(respText))
         }
+      } catch (e: CancellationException) {
+        throw e
       } catch (_: SocketTimeoutException) {
         // Expected when no messages arrive within timeout window.
         Result.success(emptyList())
       } catch (e: IOException) {
         if (call.isCanceled()) Result.success(emptyList())
         else Result.failure(IOException("getUpdates network error: ${e.javaClass.simpleName}"))
-      } finally {
-        if (activePollCall === call) activePollCall = null
+      } catch (e: Exception) {
+        Result.failure(IOException(sanitize("getUpdates error: ${e.javaClass.simpleName}", token)))
       }
     }
 
@@ -441,15 +604,22 @@ class ZaloBotClient(
         }
         val mdResult = postBotApi(token, "sendMessage", mdBody)
         if (mdResult.isFailure) {
-          // Fallback to plain text if Zalo rejects any markdown syntax.
+          val err = mdResult.exceptionOrNull()
+          val shouldFallbackToPlain = err is ZaloApiException && err.code == 400
+          if (!shouldFallbackToPlain) {
+            Log.w(TAG, "sendMessage failed for chat_id=$chatId: ${sanitize(err?.message ?: "unknown", token)}")
+            return@withContext Result.failure(err ?: IOException("sendMessage failed"))
+          }
+          // Only fall back to plain text when Zalo rejects markdown formatting (HTTP/API 400).
           val plainBody = JSONObject().apply {
             put("chat_id", chatId)
             put("text", chunk)
           }
           val plainResult = postBotApi(token, "sendMessage", plainBody)
           if (plainResult.isFailure) {
-            Log.w(TAG, "sendMessage failed for chat_id=$chatId: ${plainResult.exceptionOrNull()?.message}")
-            return@withContext Result.failure(plainResult.exceptionOrNull() ?: IOException("sendMessage failed"))
+            val plainErr = plainResult.exceptionOrNull()
+            Log.w(TAG, "sendMessage plain fallback failed for chat_id=$chatId: ${sanitize(plainErr?.message ?: "unknown", token)}")
+            return@withContext Result.failure(plainErr ?: IOException("sendMessage failed"))
           }
         }
       }
@@ -466,16 +636,12 @@ class ZaloBotClient(
     }
 
   private fun postBotApi(token: String, method: String, payload: JSONObject): Result<JSONObject> {
-    val url = "${apiBaseUrl.trimEnd('/')}/bot$token/$method"
-    val req = Request.Builder()
-      .url(url)
-      .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
-      .build()
     return try {
+      val req = buildBotRequest(token, method, payload)
       httpClient.newCall(req).execute().use { resp ->
         val text = resp.body?.string().orEmpty()
         if (!resp.isSuccessful) {
-          return Result.failure(IOException("$method HTTP ${resp.code}"))
+          return Result.failure(ZaloApiException(resp.code, "$method HTTP ${resp.code}"))
         }
         val json = try {
           JSONObject(text)
@@ -484,13 +650,15 @@ class ZaloBotClient(
         }
         if (!json.optBoolean("ok", false)) {
           val code = json.optInt("error_code", 0)
-          val desc = json.optString("description", "API error $code")
-          return Result.failure(IOException("$method failed ($code): $desc"))
+          val desc = sanitize(json.optNonNullString("description").ifBlank { "API error $code" }, token)
+          return Result.failure(ZaloApiException(code, "$method failed ($code): $desc"))
         }
         Result.success(json)
       }
+    } catch (e: ZaloApiException) {
+      Result.failure(e)
     } catch (e: Exception) {
-      Result.failure(IOException("$method error: ${e.javaClass.simpleName}"))
+      Result.failure(IOException(sanitize("$method error: ${e.javaClass.simpleName}", token)))
     }
   }
 }

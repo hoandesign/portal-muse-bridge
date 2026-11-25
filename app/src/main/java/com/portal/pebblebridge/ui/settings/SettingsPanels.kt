@@ -343,6 +343,7 @@ fun MuseSettingsPanel() {
   }
 }
 
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 private fun ZaloBotSettingsCard() {
   val config by com.portal.pebblebridge.state.BridgeRepository.config.collectAsState()
@@ -375,6 +376,10 @@ private fun ZaloBotSettingsCard() {
       label = { Text("Zalo Bot Token") },
       singleLine = true,
       visualTransformation = if (showToken) androidx.compose.ui.text.input.VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
+      keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+        autoCorrectEnabled = false,
+        keyboardType = androidx.compose.ui.text.input.KeyboardType.Password,
+      ),
       modifier = Modifier.fillMaxWidth(),
     )
 
@@ -386,24 +391,43 @@ private fun ZaloBotSettingsCard() {
       modifier = Modifier.fillMaxWidth(),
     )
 
+    if (allowedChats.isBlank()) {
+      Text(
+        "Open to any chat — message your bot once, then tap \"Lock to this chat\" to restrict access.",
+        fontSize = 11.sp,
+        color = Muted,
+      )
+    }
+
     if (status.lastChatId.isNotBlank()) {
       Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.fillMaxWidth(),
       ) {
-        Text("Last chat_id: ${status.lastChatId}", fontSize = 12.sp, color = Muted, modifier = Modifier.weight(1f))
+        Text(
+          "Last chat_id: ${status.lastChatId}",
+          fontSize = 12.sp,
+          color = Muted,
+          maxLines = 1,
+          overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+          modifier = Modifier.weight(1f),
+        )
         OutlinedButton(onClick = {
           allowedChats = status.lastChatId
           com.portal.pebblebridge.state.BridgeRepository.updateConfig(
-            config.copy(zaloBotToken = token.trim(), zaloAllowedChatIds = status.lastChatId)
+            config.copy(zaloAllowedChatIds = status.lastChatId)
           )
         }) { Text("Lock to this chat", fontSize = 12.sp) }
       }
     }
 
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+    androidx.compose.foundation.layout.FlowRow(
+      horizontalArrangement = Arrangement.spacedBy(8.dp),
+      verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
       Button(onClick = {
+        showToken = false
         com.portal.pebblebridge.state.BridgeRepository.updateConfig(
           config.copy(zaloBotToken = token.trim(), zaloAllowedChatIds = allowedChats.trim())
         )
@@ -416,6 +440,7 @@ private fun ZaloBotSettingsCard() {
 
       if (config.zaloBotToken.isNotBlank()) {
         OutlinedButton(onClick = {
+          showToken = false
           token = ""
           com.portal.pebblebridge.state.BridgeRepository.updateConfig(
             config.copy(zaloBotToken = "")
