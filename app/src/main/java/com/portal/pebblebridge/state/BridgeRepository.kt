@@ -25,6 +25,8 @@ object BridgeRepository {
   private const val KEY_MUSE_SESSION = "pref_muse_session"
   private const val KEY_MUSE_API_URL = "pref_muse_api_url"
   private const val KEY_PAIRED_NODE_ID = "pref_paired_node_id"
+  private const val KEY_ZALO_BOT_TOKEN = "pref_zalo_bot_token"
+  private const val KEY_ZALO_ALLOWED_CHAT_IDS = "pref_zalo_allowed_chat_ids"
   private const val LEGACY_KEY_MUSE_TOKEN = "pref_muse_token"
 
   val NODE_ID_REGEX = Regex("^[a-z]+-[0-9a-f]{6}$")
@@ -94,6 +96,13 @@ object BridgeRepository {
     _museLinkState.value = state
   }
 
+  private val _zaloBotStatus = MutableStateFlow(com.portal.pebblebridge.model.ZaloBotStatus())
+  val zaloBotStatus: StateFlow<com.portal.pebblebridge.model.ZaloBotStatus> = _zaloBotStatus.asStateFlow()
+
+  fun updateZaloBotStatus(transform: (com.portal.pebblebridge.model.ZaloBotStatus) -> com.portal.pebblebridge.model.ZaloBotStatus) {
+    _zaloBotStatus.update(transform)
+  }
+
   fun resetForTesting() {
     sharedPreferences = null
     _isPaired.value = false
@@ -101,6 +110,7 @@ object BridgeRepository {
     _notes.value = emptyList()
     _bleDeviceName.value = "MuseGadget"
     _museLinkState.value = com.portal.pebblebridge.model.LinkState.DISCONNECTED
+    _zaloBotStatus.value = com.portal.pebblebridge.model.ZaloBotStatus()
     nodeId = "homelink-e1890c"
     pairedNodeId = ""
   }
@@ -118,6 +128,8 @@ object BridgeRepository {
     val savedMuseSession = if (prefs.contains(KEY_MUSE_SESSION)) prefs.getString(KEY_MUSE_SESSION, "") ?: "" else BuildConfig.DEFAULT_MUSE_SESSION_ID
     val savedMuseApiUrl = prefs.getString(KEY_MUSE_API_URL, null)?.takeIf { it.isNotBlank() } ?: BuildConfig.DEFAULT_MUSE_API_URL.ifBlank { "https://api.muse.ai" }
     val savedPort = prefs.getInt(KEY_PORT, 8787)
+    val savedZaloBotToken = prefs.getString(KEY_ZALO_BOT_TOKEN, "") ?: ""
+    val savedZaloAllowedChatIds = prefs.getString(KEY_ZALO_ALLOWED_CHAT_IDS, "") ?: ""
 
     // Clean migration from legacy pref_muse_token
     val legacyToken = prefs.getString(LEGACY_KEY_MUSE_TOKEN, null)
@@ -150,6 +162,8 @@ object BridgeRepository {
       museSessionId = savedMuseSession,
       museApiUrl = savedMuseApiUrl,
       museNoiseHost = savedNoiseHost,
+      zaloBotToken = savedZaloBotToken,
+      zaloAllowedChatIds = savedZaloAllowedChatIds,
     )
     val paired = prefs.getBoolean("pref_is_paired", false)
     _isPaired.value = paired
@@ -242,6 +256,8 @@ object BridgeRepository {
       putString(KEY_MUSE_SESSION, newConfig.museSessionId)
       putString(KEY_MUSE_API_URL, newConfig.museApiUrl)
       putString(KEY_MUSE_NOISE_HOST, newConfig.museNoiseHost)
+      putString(KEY_ZALO_BOT_TOKEN, newConfig.zaloBotToken)
+      putString(KEY_ZALO_ALLOWED_CHAT_IDS, newConfig.zaloAllowedChatIds)
       apply()
     }
   }

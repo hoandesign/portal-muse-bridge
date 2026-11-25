@@ -337,6 +337,117 @@ fun MuseSettingsPanel() {
         }
         if (timers.isNotEmpty()) OutlinedButton(onClick = { com.portal.pebblebridge.home.Timers.clear() }) { Text("Cancel all") }
       }
+
+      ZaloBotSettingsCard()
+    }
+  }
+}
+
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+private fun ZaloBotSettingsCard() {
+  val config by com.portal.pebblebridge.state.BridgeRepository.config.collectAsState()
+  val status by com.portal.pebblebridge.state.BridgeRepository.zaloBotStatus.collectAsState()
+  var token by remember(config.zaloBotToken) { mutableStateOf(config.zaloBotToken) }
+  var allowedChats by remember(config.zaloAllowedChatIds) { mutableStateOf(config.zaloAllowedChatIds) }
+  var showToken by remember { mutableStateOf(false) }
+
+  SettingsCard("Zalo Bot (Long-Polling)") {
+    val (statusText, statusColor) = when (status.state) {
+      com.portal.pebblebridge.model.ZaloBotState.POLLING ->
+        "Polling · ${status.botName.ifBlank { "Connected" }} (${status.messagesBridged} msgs)" to Good
+      com.portal.pebblebridge.model.ZaloBotState.CONNECTING ->
+        "Connecting to Zalo Bot API…" to Color(0xFFFBBF24)
+      com.portal.pebblebridge.model.ZaloBotState.ERROR ->
+        "Error: ${status.lastError ?: "Unknown"}" to Bad
+      com.portal.pebblebridge.model.ZaloBotState.DISABLED ->
+        "Disabled (no Bot Token)" to Muted
+    }
+    Text(statusText, fontSize = 13.sp, color = statusColor, fontWeight = FontWeight.SemiBold)
+    Text(
+      "Uses Zalo getUpdates outbound — no webhook, domain, or tunnel needed. Messages sent to your bot go to Meta Muse AI and replies come back in Zalo.",
+      fontSize = 12.sp,
+      color = Muted,
+    )
+
+    OutlinedTextField(
+      value = token,
+      onValueChange = { token = it },
+      label = { Text("Zalo Bot Token") },
+      singleLine = true,
+      visualTransformation = if (showToken) androidx.compose.ui.text.input.VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
+      keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+        autoCorrectEnabled = false,
+        keyboardType = androidx.compose.ui.text.input.KeyboardType.Password,
+      ),
+      modifier = Modifier.fillMaxWidth(),
+    )
+
+    OutlinedTextField(
+      value = allowedChats,
+      onValueChange = { allowedChats = it },
+      label = { Text("Allowed chat_id (optional, comma-separated)") },
+      singleLine = true,
+      modifier = Modifier.fillMaxWidth(),
+    )
+
+    if (allowedChats.isBlank()) {
+      Text(
+        "Open to any chat — message your bot once, then tap \"Lock to this chat\" to restrict access.",
+        fontSize = 11.sp,
+        color = Muted,
+      )
+    }
+
+    if (status.lastChatId.isNotBlank()) {
+      Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.fillMaxWidth(),
+      ) {
+        Text(
+          "Last chat_id: ${status.lastChatId}",
+          fontSize = 12.sp,
+          color = Muted,
+          maxLines = 1,
+          overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+          modifier = Modifier.weight(1f),
+        )
+        OutlinedButton(onClick = {
+          allowedChats = status.lastChatId
+          com.portal.pebblebridge.state.BridgeRepository.updateConfig(
+            config.copy(zaloAllowedChatIds = status.lastChatId)
+          )
+        }) { Text("Lock to this chat", fontSize = 12.sp) }
+      }
+    }
+
+    androidx.compose.foundation.layout.FlowRow(
+      horizontalArrangement = Arrangement.spacedBy(8.dp),
+      verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+      Button(onClick = {
+        showToken = false
+        com.portal.pebblebridge.state.BridgeRepository.updateConfig(
+          config.copy(zaloBotToken = token.trim(), zaloAllowedChatIds = allowedChats.trim())
+        )
+        com.portal.pebblebridge.zalo.ZaloBotClient.activeInstance?.triggerRestart()
+      }) { Text("Save & connect") }
+
+      OutlinedButton(onClick = { showToken = !showToken }) {
+        Text(if (showToken) "Hide token" else "Show token")
+      }
+
+      if (config.zaloBotToken.isNotBlank()) {
+        OutlinedButton(onClick = {
+          showToken = false
+          token = ""
+          com.portal.pebblebridge.state.BridgeRepository.updateConfig(
+            config.copy(zaloBotToken = "")
+          )
+          com.portal.pebblebridge.zalo.ZaloBotClient.activeInstance?.triggerRestart()
+        }) { Text("Disable") }
+      }
     }
   }
 }
